@@ -6,32 +6,35 @@
 #include <linux/list.h>
 #include <linux/log2.h>
 
-/* Note
- * sector_t = u64 = unsigned long long
- */
+// note: sector_t = u64 = unsigned long long
 
 #define WRITE_CACHE_SIZE 200
 #define READ_CACHE_SIZE 200
 
-/* seek value =
- * MAX(24bit) {
- *     [max(0, k - unit_size) *
- *     (read_flag + t * write_flag) /
- *     k
- * } *
- * (T1 + T2 * seek_distance)
- *
- * note that the kernel does not support float arithmetic,
- */
+/// seek value =
+/// MAX(24bit) {
+///     [max(0, k - unit_size) *
+///     (read_flag + t * write_flag) /
+///     k
+/// } *
+/// (T1 + T2 * seek_distance)
+/// note: that the kernel does not support float arithmetic,
 #define K  512
 #define T   90/100
 #define T1   1
 #define T2   100
 
-/* data could be stored on hdd(COLD), SSD(CACHED for READ or WRITE) */
+/// data could be stored on hdd(COLD), SSD(CACHED for READ or WRITE)
 #define COLD        1 << 0
 #define WRITE_CACHE 1 << 1
 #define READ_CACHE  1 << 2
+
+// when io actions accumulate to the threshold,
+// we will move hot data blocks to ssd.
+#define IO_COUNT_THRESHOLD 10000
+// when the delta value of read count and write count exceed this threshold,
+// we move data block from one list to the other.
+#define RW_STATE_THRESHOLD 20
 
 struct cwr_unit_meta
 {
@@ -60,12 +63,174 @@ struct cwr_context
     struct cwr_unit_meta* unit_meta;
     struct list_head read_list;
     struct list_head write_list;
+
+    unsigned int io_count;
 };
 
+/// list sort functions, code snippet from linux 4.4.2
+#define MAX_LIST_LENGTH_BITS 20
+
 /*
- * dmsetup create dev_name --table
- * '0 102400 cwr unit_size /dev/hdd /dev/write_cache /dev/read-cache'
+ * Returns a list organized in an intermediate format suited
+ * to chaining of merge() calls: null-terminated, no reserved or
+ * sentinel head node, "prev" links not maintained.
  */
+static struct list_head *merge(void *priv,
+				int (*cmp)(void *priv, struct list_head *a,
+					struct list_head *b),
+				struct list_head *a, struct list_head *b)
+{
+	struct list_head head, *tail = &head;
+
+	while (a && b) {
+		/* if equal, take 'a' -- important for sort stability */
+		if ((*cmp)(priv, a, b) <= 0) {
+			tail->next = a;
+			a = a->next;
+		} else {
+			tail->next = b;
+			b = b->next;
+		}
+		tail = tail->next;
+	}
+	tail->next = a?:b;
+	return head.next;
+}
+
+/*
+ * Combine final list merge with restoration of standard doubly-linked
+ * list structure.  This approach duplicates code from merge(), but
+ * runs faster than the tidier alternatives of either a separate final
+ * prev-link restoration pass, or maintaining the prev links
+ * throughout.
+ */
+static void merge_and_restore_back_links(void *priv,
+				int (*cmp)(void *priv, struct list_head *a,
+					struct list_head *b),
+				struct list_head *head,
+				struct list_head *a, struct list_head *b)
+{
+	struct list_head *tail = head;
+	u8 count = 0;
+
+	while (a && b) {
+		/* if equal, take 'a' -- important for sort stability */
+		if ((*cmp)(priv, a, b) <= 0) {
+			tail->next = a;
+			a->prev = tail;
+			a = a->next;
+		} else {
+			tail->next = b;
+			b->prev = tail;
+			b = b->next;
+		}
+		tail = tail->next;
+	}
+	tail->next = a ? : b;
+
+	do {
+		/*
+		 * In worst cases this loop may run many iterations.
+		 * Continue callbacks to the client even though no
+		 * element comparison is needed, so the client's cmp()
+		 * routine can invoke cond_resched() periodically.
+		 */
+		if (unlikely(!(++count)))
+			(*cmp)(priv, tail->next, tail->next);
+
+		tail->next->prev = tail;
+		tail = tail->next;
+	} while (tail->next);
+
+	tail->next = head;
+	head->prev = tail;
+}
+
+/**
+ * list_sort - sort a list
+ * @priv: private data, opaque to list_sort(), passed to @cmp
+ * @head: the list to sort
+ * @cmp: the elements comparison function
+ *
+ * This function implements "merge sort", which has O(nlog(n))
+ * complexity.
+ *
+ * The comparison function @cmp must return a negative value if @a
+ * should sort before @b, and a positive value if @a should sort after
+ * @b. If @a and @b are equivalent, and their original relative
+ * ordering is to be preserved, @cmp must return 0.
+ */
+void list_sort(void *priv, struct list_head *head,
+		int (*cmp)(void *priv, struct list_head *a,
+			struct list_head *b))
+{
+	struct list_head *part[MAX_LIST_LENGTH_BITS+1]; /* sorted partial lists
+						-- last slot is a sentinel */
+	int lev;  /* index into part[] */
+	int max_lev = 0;
+	struct list_head *list;
+
+	if (list_empty(head))
+		return;
+
+	memset(part, 0, sizeof(part));
+
+	head->prev->next = NULL;
+	list = head->next;
+
+	while (list) {
+		struct list_head *cur = list;
+		list = list->next;
+		cur->next = NULL;
+
+		for (lev = 0; part[lev]; lev++) {
+			cur = merge(priv, cmp, part[lev], cur);
+			part[lev] = NULL;
+		}
+		if (lev > max_lev) {
+			if (unlikely(lev >= ARRAY_SIZE(part)-1)) {
+				//printk_once(KERN_DEBUG "list too long for efficiency\n");
+				lev--;
+			}
+			max_lev = lev;
+		}
+		part[lev] = cur;
+	}
+
+	for (lev = 0; lev < max_lev; lev++)
+		if (part[lev])
+			list = merge(priv, cmp, part[lev], list);
+
+	merge_and_restore_back_links(priv, cmp, head, part[max_lev], list);
+}
+
+static int list_sort_cmp(void *priv, struct list_head* a, struct list_head* b)
+{
+    /*
+     * The comparison function @cmp must return a negative value if @a
+     * should sort before @b
+    */
+    struct cwr_unit_meta* unit_meta_a, * unit_meta_b;
+    unit_meta_a = list_entry(a, struct cwr_unit_meta, list);
+    unit_meta_b = list_entry(b, struct cwr_unit_meta, list);
+    if(unit_meta_a->z_value == unit_meta_b->z_value) return 0;
+    return unit_meta_a->z_value < unit_meta_b->z_value;
+}
+
+static void do_io_count(struct cwr_context* cc)
+{
+    // we don't need to protect io count against race condition,
+    // as we don't need to perform swap action precisely.
+    cc->io_count++;
+    if(cc->io_count >= IO_COUNT_THRESHOLD)
+    {
+        // sort hot data to the front of lists
+        list_sort(0, &cc->read_list, list_sort_cmp);
+        list_sort(0, &cc->write_list, list_sort_cmp);
+        cc->io_count = 0;
+    }
+}
+
 static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
 {
     struct cwr_context* cc = (struct cwr_context*)dt->private;
@@ -104,16 +269,22 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
 
     bio->bi_bdev = cc->unit_meta[unit_index].dev->bdev;
 
+    do_io_count(cc);
+
     return DM_MAPIO_REMAPPED;
 }
 
+/*
+ * dmsetup create dev_name --table
+ * '0 102400 cwr unit_size /dev/hdd /dev/write_cache /dev/read-cache'
+ */
 static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
 {
     struct cwr_context* cc;
     int re = 0;
     int unit_amount, i;
 
-    if(argc != 4)
+    if(argc != 3)
     {
         dt->error = "dm-cwr: invalid argument count";
         return -EINVAL;
@@ -159,7 +330,7 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
                         dm_table_get_mode(dt->table), &cc->cold_dev);
     re |= dm_get_device(dt, argv[2], 0, cc->write_dev_size,
                         dm_table_get_mode(dt->table), &cc->write_dev);
-    re |= dm_get_device(dt, argv[4], 0, cc->read_dev_size,
+    re |= dm_get_device(dt, argv[3], 0, cc->read_dev_size,
                         dm_table_get_mode(dt->table), &cc->read_dev);
     if(re != 0) goto device_invalid;
 
@@ -182,6 +353,7 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
     if(re != 0) goto size_invalid;
 
     cc->last_unit = 0;
+    cc->io_count = 0;
 
     INIT_LIST_HEAD(&cc->read_list);
     INIT_LIST_HEAD(&cc->write_list);
@@ -197,6 +369,10 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
 
     dt->private = cc;
 
+    printk(KERN_DEBUG "a new cwr device is constructed.");
+    printk(KERN_DEBUG "unit size: %llu", cc->unit_size);
+    printk(KERN_DEBUG "c: %s, w:%s, r:%s",
+           cc->cold_dev->name, cc->write_dev->name, cc->read_dev->name);
     return 0;
 
 size_invalid:
@@ -219,6 +395,10 @@ static void cwr_dtr(struct dm_target *dt)
     dm_put_device(dt, cc->read_dev);
     kfree(cc->unit_meta);
     kfree(cc);
+
+    printk(KERN_DEBUG "a cwr device is destructed.");
+    printk(KERN_DEBUG "c: %s, w:%s, r:%s",
+           cc->cold_dev->name, cc->write_dev->name, cc->read_dev->name);
 }
 
 static struct target_type cwr_target = {
@@ -242,14 +422,16 @@ static int __init cwr_init(void)
         return re;
     }
 
+    printk(KERN_DEBUG "cwr loaded.");
     return 0;
 }
 
 static void __exit cwr_done(void)
 {
     dm_unregister_target(&cwr_target);
+    printk(KERN_DEBUG "cwr unloaded.");
 }
 
 module_init(cwr_init);
 module_exit(cwr_done);
-MODULE_LICENSE("CC");
+MODULE_LICENSE("GPL");
