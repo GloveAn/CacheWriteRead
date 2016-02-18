@@ -92,7 +92,7 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
         z_value = K - cc->unit_size;
         if(z_value < 0) z_value = 0;
         z_value = z_value * (read_flag + write_flag * T);
-        do_div(z_value, K);
+        do_div(z_value, K); // do_div: int64/int32
         if(z_value >= 0xFFFFFF) z_value = 0xFFFFFF;
         do_div(seek_distance, T2);
         z_value = (T1 + seek_distance) << z_value;
@@ -102,7 +102,9 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     cc->unit_meta[unit_index].write_count += write_flag;
     cc->unit_meta[unit_index].z_value += z_value;
 
-    return 0;
+    bio->bi_bdev = cc->unit_meta[unit_index].dev->bdev;
+
+    return DM_MAPIO_REMAPPED;
 }
 
 static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
@@ -185,6 +187,9 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
     INIT_LIST_HEAD(&cc->write_list);
     for(i = 0; i < unit_amount; i++)
     {
+        cc->unit_meta[i].dev = cc->cold_dev;
+        cc->unit_meta[i].offset = i;
+
         INIT_LIST_HEAD(&cc->unit_meta[i].list);
         // initially add all nodes to read list
         list_add(&cc->unit_meta[i].list, &cc->read_list);
