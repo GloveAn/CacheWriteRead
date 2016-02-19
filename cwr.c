@@ -219,14 +219,68 @@ static int list_sort_cmp(void *priv, struct list_head* a, struct list_head* b)
 
 static void do_io_count(struct cwr_context* cc)
 {
+    struct list_head *cur_node, *next_node;
+    struct cwr_unit_meta* cur_unit;
+
     // we don't need to protect io count against race condition,
     // as we don't need to perform swap action precisely.
     cc->io_count++;
     if(cc->io_count >= IO_COUNT_THRESHOLD)
     {
-        // sort hot data to the front of lists
+        /// clear read count and write count to prevent overflow
+        list_for_each(cur_node, &cc->read_list)
+        {
+	        cur_unit = list_entry(cur_node, struct cwr_unit_meta, list);
+            if(cur_unit->read_count > cur_unit->write_count)
+            {
+                cur_unit->read_count -= cur_unit->write_count;
+                cur_unit->write_count = 0;
+            }
+            else
+            {
+                cur_unit->write_count -= cur_unit->read_count;
+                cur_unit->read_count = 0;
+            }
+	    }
+        list_for_each(cur_node, &cc->write_list)
+        {
+	        cur_unit = list_entry(cur_node, struct cwr_unit_meta, list);
+            if(cur_unit->read_count > cur_unit->write_count)
+            {
+                cur_unit->read_count -= cur_unit->write_count;
+                cur_unit->write_count = 0;
+            }
+            else
+            {
+                cur_unit->write_count -= cur_unit->read_count;
+                cur_unit->read_count = 0;
+            }
+	    }
+
+        /// arrange list node by its read count and write count
+        list_for_each_safe(cur_node, next_node, &cc->read_list)
+        {
+            cur_unit = list_entry(cur_node, struct cwr_unit_meta, list);
+            if(cur_unit->write_count > RW_STATE_THRESHOLD)
+            {
+                list_del_init(cur_node);
+                list_add(cur_node, &cc->write_list);
+            }
+        }
+        list_for_each_safe(cur_node, next_node, &cc->write_list)
+        {
+            cur_unit = list_entry(cur_node, struct cwr_unit_meta, list);
+            if(cur_unit->read_count > RW_STATE_THRESHOLD)
+            {
+                list_del_init(cur_node);
+                list_add(cur_node, &cc->read_list);
+            }
+        }
+
+        /// sort hot data to the front of lists
         list_sort(0, &cc->read_list, list_sort_cmp);
         list_sort(0, &cc->write_list, list_sort_cmp);
+
         cc->io_count = 0;
     }
 }
@@ -282,7 +336,7 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
 {
     struct cwr_context* cc;
     int re = 0;
-    int unit_amount, i;
+    int unit_amount, i, j;
 
     if(argc != 3)
     {
@@ -357,14 +411,31 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
 
     INIT_LIST_HEAD(&cc->read_list);
     INIT_LIST_HEAD(&cc->write_list);
-    for(i = 0; i < unit_amount; i++)
+    i = 0;
+    for(j = 0; j < READ_CACHE_SIZE; i++, j++)
+    {
+        cc->unit_meta[i].dev = cc->read_dev;
+        cc->unit_meta[i].offset = j;
+
+        INIT_LIST_HEAD(&cc->unit_meta[i].list);
+        list_add(&cc->unit_meta[i].list, &cc->read_list);
+    }
+    for(j = 0; j < WRITE_CACHE_SIZE; i++, j++)
+    {
+        cc->unit_meta[i].dev = cc->write_dev;
+        cc->unit_meta[i].offset = j;
+
+        INIT_LIST_HEAD(&cc->unit_meta[i].list);
+        list_add(&cc->unit_meta[i].list, &cc->write_list);
+    }
+    for(j = 0; i < unit_amount; i++, j++)
     {
         cc->unit_meta[i].dev = cc->cold_dev;
-        cc->unit_meta[i].offset = i;
+        cc->unit_meta[i].offset = j;
 
         INIT_LIST_HEAD(&cc->unit_meta[i].list);
         // initially add all nodes to read list
-        list_add(&cc->unit_meta[i].list, &cc->read_list);
+        list_add(&cc->unit_meta[i].list, &cc->write_list);
     }
 
     dt->private = cc;
