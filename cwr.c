@@ -49,6 +49,7 @@ struct cwr_unit_meta
 
 struct cwr_context
 {
+    /// measured by sector
     sector_t unit_size;
     sector_t last_unit;
 
@@ -56,6 +57,7 @@ struct cwr_context
     struct dm_dev* read_dev;
     struct dm_dev* write_dev;
 
+    /// measured by sector
     sector_t cold_dev_size;
     sector_t read_dev_size;
     sector_t write_dev_size;
@@ -322,6 +324,7 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     cc->unit_meta[unit_index].z_value += z_value;
 
     bio->bi_bdev = cc->unit_meta[unit_index].dev->bdev;
+    bio->bi_sector = cc->unit_meta[unit_index].offset * cc->unit_size;
 
     do_io_count(cc);
 
@@ -338,7 +341,7 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
     int re = 0;
     int unit_amount, i, j;
 
-    if(argc != 3)
+    if(argc != 4)
     {
         dt->error = "dm-cwr: invalid argument count";
         return -EINVAL;
@@ -412,6 +415,7 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
     INIT_LIST_HEAD(&cc->read_list);
     INIT_LIST_HEAD(&cc->write_list);
     i = 0;
+    // map first part to read cache
     for(j = 0; j < READ_CACHE_SIZE; i++, j++)
     {
         cc->unit_meta[i].dev = cc->read_dev;
@@ -420,6 +424,7 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
         INIT_LIST_HEAD(&cc->unit_meta[i].list);
         list_add(&cc->unit_meta[i].list, &cc->read_list);
     }
+    // map second part to write cache
     for(j = 0; j < WRITE_CACHE_SIZE; i++, j++)
     {
         cc->unit_meta[i].dev = cc->write_dev;
@@ -428,6 +433,7 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
         INIT_LIST_HEAD(&cc->unit_meta[i].list);
         list_add(&cc->unit_meta[i].list, &cc->write_list);
     }
+    // map last part to cold hdd
     for(j = 0; i < unit_amount; i++, j++)
     {
         cc->unit_meta[i].dev = cc->cold_dev;
