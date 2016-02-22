@@ -38,7 +38,7 @@
 #define RW_STATE_THRESHOLD 20
 
 // the interval for manage data block hotness
-#define UNIT_MANAGE_INTERVAL HZ * 20 // unit: second (s)
+#define UNIT_MANAGE_INTERVAL 20 // unit: second (s)
 
 /// a state could be ready, or moving between hdd and caches
 #define UNIT_STATE_READY  1 << 0
@@ -78,6 +78,7 @@ struct cwr_context
     struct list_head write_list;
 
     unsigned int io_count;
+    unsigned int old_io_count; // for calculating io frequency
     struct timer_list unit_manage_timer;
     unsigned int state;
 };
@@ -242,10 +243,15 @@ void manage_unit(unsigned long data)
     struct cwr_unit_meta* cur_unit;
     unsigned int read_list_length = 0;
     unsigned int write_list_length = 0;
+    unsigned int io_frenquency;
+
+    io_frenquency = (cc->io_count - cc->old_io_count) / UNIT_MANAGE_INTERVAL;
+    cc->old_io_count = cc->io_count;
 
     // if the cwr device is already under data moving state, we should quit
     if(cc->state != CWR_STATE_MOVING &&
-       cc->io_count >= IO_COUNT_THRESHOLD)
+       cc->io_count >= IO_COUNT_THRESHOLD &&
+       io_frenquency == 0)
     {
         /// clear read count and write count to prevent overflow
         list_for_each(cur_node, &cc->read_list)
@@ -316,9 +322,10 @@ void manage_unit(unsigned long data)
            printk_once(KERN_ALERT "Not enough data to fill cache!");
 
         cc->io_count = 0;
+        cc->old_io_count = 0;
     }
 
-    cc->unit_manage_timer.expires = jiffies + UNIT_MANAGE_INTERVAL;
+    cc->unit_manage_timer.expires = jiffies + UNIT_MANAGE_INTERVAL * HZ;
     add_timer(&cc->unit_manage_timer);
 }
 
@@ -367,6 +374,7 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
    // as we don't need to perform swap action precisely.
    cc->io_count++;
 
+   /// FIXME! bio may cross multiple units and should be splitted
     bio->bi_bdev = cc->unit_meta[unit_index].dev->bdev;
     bio->bi_sector = cc->unit_meta[unit_index].offset * cc->unit_size;
 
@@ -458,7 +466,7 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
     init_timer(&cc->unit_manage_timer);
     cc->unit_manage_timer.data = (unsigned long)cc;
     cc->unit_manage_timer.function = manage_unit;
-    cc->unit_manage_timer.expires = jiffies + HZ;
+    cc->unit_manage_timer.expires = jiffies + UNIT_MANAGE_INTERVAL * HZ;
     add_timer(&cc->unit_manage_timer);
 
     INIT_LIST_HEAD(&cc->read_list);
