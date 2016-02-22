@@ -231,6 +231,8 @@ static void do_io_count(struct cwr_context* cc)
 {
     struct list_head *cur_node, *next_node;
     struct cwr_unit_meta* cur_unit;
+    unsigned int read_list_length = 0;
+    unsigned int write_list_length = 0;
 
     // we don't need to protect io count against race condition,
     // as we don't need to perform swap action precisely.
@@ -276,20 +278,34 @@ static void do_io_count(struct cwr_context* cc)
                 list_del_init(cur_node);
                 list_add(cur_node, &cc->write_list);
             }
+            else
+            {
+                read_list_length++;
+            }
         }
         list_for_each_safe(cur_node, next_node, &cc->write_list)
         {
             cur_unit = list_entry(cur_node, struct cwr_unit_meta, list);
-         ho    if(cur_unit->read_count > RW_STATE_THRESHOLD)
+            if(cur_unit->read_count > RW_STATE_THRESHOLD)
             {
                 list_del_init(cur_node);
                 list_add(cur_node, &cc->read_list);
+            }
+            else
+            {
+                write_list_length++;
             }
         }
 
         /// sort hot data to the front of lists
         list_sort(0, &cc->read_list, list_sort_cmp);
         list_sort(0, &cc->write_list, list_sort_cmp);
+
+        /// BUG! consider no data block is marked read or write,
+        /// then the the device cannot hold all the data.
+        if(read_list_length < READ_CACHE_SIZE ||
+           write_list_length < WRITE_CACHE_SIZE)
+           printk_once(KERN_ALERT "Not enough data to fill cache");
 
         cc->io_count = 0;
     }
