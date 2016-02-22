@@ -36,6 +36,10 @@
 // we move data block from one list to the other.
 #define RW_STATE_THRESHOLD 20
 
+/// a state could be ready, or moving between hdd and caches
+#define UNIT_STATE_READY  1 << 0
+#define UNIT_STATE_MOVING 1 << 1
+
 struct cwr_unit_meta
 {
     // logic location is indicated by array index
@@ -44,6 +48,7 @@ struct cwr_unit_meta
     unsigned int write_count;
     struct dm_dev* dev;
     sector_t offset;
+    unsigned int state;
     struct list_head list;
 };
 
@@ -429,6 +434,7 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
     {
         cc->unit_meta[i].dev = cc->write_dev;
         cc->unit_meta[i].offset = j;
+        cc->unit_meta[i].state = UNIT_STATE_READY;
 
         INIT_LIST_HEAD(&cc->unit_meta[i].list);
         list_add(&cc->unit_meta[i].list, &cc->write_list);
