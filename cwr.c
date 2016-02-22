@@ -74,7 +74,9 @@ struct cwr_context
     unsigned int io_count;
 };
 
-/// list sort functions, code snippet from linux 4.4.2
+static DECLARE_WAIT_QUEUE_HEAD(wait_queue);
+
+/// START list sort functions, code snippet from linux 4.4.2
 #define MAX_LIST_LENGTH_BITS 20
 
 /*
@@ -210,6 +212,7 @@ void list_sort(void *priv, struct list_head *head,
 
 	merge_and_restore_back_links(priv, cmp, head, part[max_lev], list);
 }
+/// END list sort functions, code snippet from linux 4.4.2
 
 static int list_sort_cmp(void *priv, struct list_head* a, struct list_head* b)
 {
@@ -277,7 +280,7 @@ static void do_io_count(struct cwr_context* cc)
         list_for_each_safe(cur_node, next_node, &cc->write_list)
         {
             cur_unit = list_entry(cur_node, struct cwr_unit_meta, list);
-            if(cur_unit->read_count > RW_STATE_THRESHOLD)
+         ho    if(cur_unit->read_count > RW_STATE_THRESHOLD)
             {
                 list_del_init(cur_node);
                 list_add(cur_node, &cc->read_list);
@@ -327,6 +330,11 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     cc->unit_meta[unit_index].read_count += read_flag;
     cc->unit_meta[unit_index].write_count += write_flag;
     cc->unit_meta[unit_index].z_value += z_value;
+
+    // wait if data block is moving
+    if(cc->unit_meta[unit_index].state != UNIT_STATE_READY)
+        wait_event(wait_queue,
+                   cc->unit_meta[unit_index].state == UNIT_STATE_READY);
 
     bio->bi_bdev = cc->unit_meta[unit_index].dev->bdev;
     bio->bi_sector = cc->unit_meta[unit_index].offset * cc->unit_size;
