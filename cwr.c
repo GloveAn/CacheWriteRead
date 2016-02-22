@@ -5,8 +5,9 @@
 #include <linux/device-mapper.h>
 #include <linux/list.h>
 #include <linux/log2.h>
+#include <linux/timer.h>
 
-// note: sector_t = u64 = unsigned long long
+// NOTE: sector_t = u64 = unsigned long long
 
 #define WRITE_CACHE_SIZE 200
 #define READ_CACHE_SIZE 200
@@ -18,7 +19,7 @@
 ///     k
 /// } *
 /// (T1 + T2 * seek_distance)
-/// note: that the kernel does not support float arithmetic,
+/// NOTE: the kernel does not support float arithmetic,
 #define K  512
 #define T   90/100
 #define T1   1
@@ -36,9 +37,14 @@
 // we move data block from one list to the other.
 #define RW_STATE_THRESHOLD 20
 
+// the interval for manage data block hotness
+#define UNIT_MANAGE_INTERVAL HZ * 20 // unit: second (s)
+
 /// a state could be ready, or moving between hdd and caches
 #define UNIT_STATE_READY  1 << 0
 #define UNIT_STATE_MOVING 1 << 1
+#define CWR_STATE_READY  1 << 0
+#define CWR_STATE_MOVING 1 << 1
 
 struct cwr_unit_meta
 {
@@ -72,6 +78,8 @@ struct cwr_context
     struct list_head write_list;
 
     unsigned int io_count;
+    struct timer_list unit_manage_timer;
+    unsigned int state;
 };
 
 static DECLARE_WAIT_QUEUE_HEAD(wait_queue);
@@ -227,17 +235,17 @@ static int list_sort_cmp(void *priv, struct list_head* a, struct list_head* b)
     return unit_meta_a->z_value < unit_meta_b->z_value;
 }
 
-static void do_io_count(struct cwr_context* cc)
+void manage_unit(unsigned long data)
 {
+    struct cwr_context *cc = (struct cwr_context *)data;
     struct list_head *cur_node, *next_node;
     struct cwr_unit_meta* cur_unit;
     unsigned int read_list_length = 0;
     unsigned int write_list_length = 0;
 
-    // we don't need to protect io count against race condition,
-    // as we don't need to perform swap action precisely.
-    cc->io_count++;
-    if(cc->io_count >= IO_COUNT_THRESHOLD)
+    // if the cwr device is already under data moving state, we should quit
+    if(cc->state != CWR_STATE_MOVING &&
+       cc->io_count >= IO_COUNT_THRESHOLD)
     {
         /// clear read count and write count to prevent overflow
         list_for_each(cur_node, &cc->read_list)
@@ -301,14 +309,17 @@ static void do_io_count(struct cwr_context* cc)
         list_sort(0, &cc->read_list, list_sort_cmp);
         list_sort(0, &cc->write_list, list_sort_cmp);
 
-        /// BUG! consider no data block is marked read or write,
+        /// FIXME! consider no data block is marked read or write,
         /// then the the device cannot hold all the data.
         if(read_list_length < READ_CACHE_SIZE ||
            write_list_length < WRITE_CACHE_SIZE)
-           printk_once(KERN_ALERT "Not enough data to fill cache");
+           printk_once(KERN_ALERT "Not enough data to fill cache!");
 
         cc->io_count = 0;
     }
+
+    cc->unit_manage_timer.expires = jiffies + UNIT_MANAGE_INTERVAL;
+    add_timer(&cc->unit_manage_timer);
 }
 
 static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
@@ -320,7 +331,7 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
 
     offset = bio->bi_sector - dt->begin;
     unit_index = offset >> (cc->unit_size - 1);
-    // Is seek_distance an absolute value?
+    // is seek_distance an absolute value?
     seek_distance = cc->last_unit - unit_index;
     if(seek_distance < 0) seek_distance = -seek_distance;
 
@@ -352,10 +363,12 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
         wait_event(wait_queue,
                    cc->unit_meta[unit_index].state == UNIT_STATE_READY);
 
+   // we don't need to protect io count against race condition,
+   // as we don't need to perform swap action precisely.
+   cc->io_count++;
+
     bio->bi_bdev = cc->unit_meta[unit_index].dev->bdev;
     bio->bi_sector = cc->unit_meta[unit_index].offset * cc->unit_size;
-
-    do_io_count(cc);
 
     return DM_MAPIO_REMAPPED;
 }
@@ -440,6 +453,13 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
 
     cc->last_unit = 0;
     cc->io_count = 0;
+    cc->state = CWR_STATE_READY;
+
+    init_timer(&cc->unit_manage_timer);
+    cc->unit_manage_timer.data = (unsigned long)cc;
+    cc->unit_manage_timer.function = manage_unit;
+    cc->unit_manage_timer.expires = jiffies + HZ;
+    add_timer(&cc->unit_manage_timer);
 
     INIT_LIST_HEAD(&cc->read_list);
     INIT_LIST_HEAD(&cc->write_list);
