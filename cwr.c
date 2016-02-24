@@ -1,227 +1,10 @@
-#include <linux/kernel.h>
-#include <linux/module.h>
-#include <linux/init.h>
-#include <linux/bio.h>
-#include <linux/device-mapper.h>
-#include <linux/list.h>
-#include <linux/log2.h>
-#include <linux/timer.h>
+#include "cwr.h"
 
-// NOTE: sector_t = u64 = unsigned long long
+static struct kmem_cache *bio_info_cache;
+static mempool_t *bio_info_pool;
 
-#define WRITE_CACHE_SIZE 200
-#define READ_CACHE_SIZE 200
-
-/// seek value =
-/// MAX(24bit) {
-///     [max(0, k - unit_size) *
-///     (read_flag + t * write_flag) /
-///     k
-/// } *
-/// (T1 + T2 * seek_distance)
-/// NOTE: the kernel does not support float arithmetic,
-#define K  512
-#define T   90/100
-#define T1   1
-#define T2   100
-
-/// data could be stored on hdd(COLD), SSD(CACHED for READ or WRITE)
-#define COLD        1 << 0
-#define WRITE_CACHE 1 << 1
-#define READ_CACHE  1 << 2
-
-// when io actions accumulate to the threshold,
-// we will move hot data blocks to ssd.
-#define IO_COUNT_THRESHOLD 10000
-// when the delta value of read count and write count exceed this threshold,
-// we move data block from one list to the other.
-#define RW_STATE_THRESHOLD 20
-
-// the interval for manage data block hotness
-#define UNIT_MANAGE_INTERVAL 20 // unit: second (s)
-
-/// a state could be ready, or moving between hdd and caches
-#define UNIT_STATE_READY  1 << 0
-#define UNIT_STATE_MOVING 1 << 1
-#define CWR_STATE_READY  1 << 0
-#define CWR_STATE_MOVING 1 << 1
-
-struct cwr_unit_meta
-{
-    // logic location is indicated by array index
-    unsigned int z_value;
-    unsigned int read_count;
-    unsigned int write_count;
-    struct dm_dev* dev;
-    sector_t offset;
-    unsigned int state;
-    struct list_head list;
-};
-
-struct cwr_context
-{
-    /// measured by sector
-    sector_t unit_size;
-    sector_t last_unit;
-
-    struct dm_dev* cold_dev;
-    struct dm_dev* read_dev;
-    struct dm_dev* write_dev;
-
-    /// measured by sector
-    sector_t cold_dev_size;
-    sector_t read_dev_size;
-    sector_t write_dev_size;
-
-    struct cwr_unit_meta* unit_meta;
-    struct list_head read_list;
-    struct list_head write_list;
-
-    unsigned int io_count;
-    unsigned int old_io_count; // for calculating io frequency
-    struct timer_list unit_manage_timer;
-    unsigned int state;
-};
-
+#if 0
 static DECLARE_WAIT_QUEUE_HEAD(wait_queue);
-
-/// START list sort functions, code snippet from linux 4.4.2
-#define MAX_LIST_LENGTH_BITS 20
-
-/*
- * Returns a list organized in an intermediate format suited
- * to chaining of merge() calls: null-terminated, no reserved or
- * sentinel head node, "prev" links not maintained.
- */
-static struct list_head *merge(void *priv,
-				int (*cmp)(void *priv, struct list_head *a,
-					struct list_head *b),
-				struct list_head *a, struct list_head *b)
-{
-	struct list_head head, *tail = &head;
-
-	while (a && b) {
-		/* if equal, take 'a' -- important for sort stability */
-		if ((*cmp)(priv, a, b) <= 0) {
-			tail->next = a;
-			a = a->next;
-		} else {
-			tail->next = b;
-			b = b->next;
-		}
-		tail = tail->next;
-	}
-	tail->next = a?:b;
-	return head.next;
-}
-
-/*
- * Combine final list merge with restoration of standard doubly-linked
- * list structure.  This approach duplicates code from merge(), but
- * runs faster than the tidier alternatives of either a separate final
- * prev-link restoration pass, or maintaining the prev links
- * throughout.
- */
-static void merge_and_restore_back_links(void *priv,
-				int (*cmp)(void *priv, struct list_head *a,
-					struct list_head *b),
-				struct list_head *head,
-				struct list_head *a, struct list_head *b)
-{
-	struct list_head *tail = head;
-	u8 count = 0;
-
-	while (a && b) {
-		/* if equal, take 'a' -- important for sort stability */
-		if ((*cmp)(priv, a, b) <= 0) {
-			tail->next = a;
-			a->prev = tail;
-			a = a->next;
-		} else {
-			tail->next = b;
-			b->prev = tail;
-			b = b->next;
-		}
-		tail = tail->next;
-	}
-	tail->next = a ? : b;
-
-	do {
-		/*
-		 * In worst cases this loop may run many iterations.
-		 * Continue callbacks to the client even though no
-		 * element comparison is needed, so the client's cmp()
-		 * routine can invoke cond_resched() periodically.
-		 */
-		if (unlikely(!(++count)))
-			(*cmp)(priv, tail->next, tail->next);
-
-		tail->next->prev = tail;
-		tail = tail->next;
-	} while (tail->next);
-
-	tail->next = head;
-	head->prev = tail;
-}
-
-/**
- * list_sort - sort a list
- * @priv: private data, opaque to list_sort(), passed to @cmp
- * @head: the list to sort
- * @cmp: the elements comparison function
- *
- * This function implements "merge sort", which has O(nlog(n))
- * complexity.
- *
- * The comparison function @cmp must return a negative value if @a
- * should sort before @b, and a positive value if @a should sort after
- * @b. If @a and @b are equivalent, and their original relative
- * ordering is to be preserved, @cmp must return 0.
- */
-void list_sort(void *priv, struct list_head *head,
-		int (*cmp)(void *priv, struct list_head *a,
-			struct list_head *b))
-{
-	struct list_head *part[MAX_LIST_LENGTH_BITS+1]; /* sorted partial lists
-						-- last slot is a sentinel */
-	int lev;  /* index into part[] */
-	int max_lev = 0;
-	struct list_head *list;
-
-	if (list_empty(head))
-		return;
-
-	memset(part, 0, sizeof(part));
-
-	head->prev->next = NULL;
-	list = head->next;
-
-	while (list) {
-		struct list_head *cur = list;
-		list = list->next;
-		cur->next = NULL;
-
-		for (lev = 0; part[lev]; lev++) {
-			cur = merge(priv, cmp, part[lev], cur);
-			part[lev] = NULL;
-		}
-		if (lev > max_lev) {
-			if (unlikely(lev >= ARRAY_SIZE(part)-1)) {
-				//printk_once(KERN_DEBUG "list too long for efficiency\n");
-				lev--;
-			}
-			max_lev = lev;
-		}
-		part[lev] = cur;
-	}
-
-	for (lev = 0; lev < max_lev; lev++)
-		if (part[lev])
-			list = merge(priv, cmp, part[lev], list);
-
-	merge_and_restore_back_links(priv, cmp, head, part[max_lev], list);
-}
-/// END list sort functions, code snippet from linux 4.4.2
 
 static int list_sort_cmp(void *priv, struct list_head* a, struct list_head* b)
 {
@@ -236,10 +19,10 @@ static int list_sort_cmp(void *priv, struct list_head* a, struct list_head* b)
     return unit_meta_a->z_value < unit_meta_b->z_value;
 }
 
-void manage_unit(unsigned long data)
+static void manage_unit(unsigned long data)
 {
     struct cwr_context *cc = (struct cwr_context *)data;
-    struct list_head *cur_node, *next_node;
+    struct list_head *cur_node, *next_node, *move_out, *move_in;
     struct cwr_unit_meta* cur_unit;
     unsigned int read_list_length = 0;
     unsigned int write_list_length = 0;
@@ -251,8 +34,10 @@ void manage_unit(unsigned long data)
     // if the cwr device is already under data moving state, we should quit
     if(cc->state != CWR_STATE_MOVING &&
        cc->io_count >= IO_COUNT_THRESHOLD &&
-       io_frenquency == 0)
+       io_frenquency == UNIT_MANAGE_THRESHOLD)
     {
+        cc->state = CWR_STATE_MOVING;
+
         /// clear read count and write count to prevent overflow
         list_for_each(cur_node, &cc->read_list)
         {
@@ -321,38 +106,81 @@ void manage_unit(unsigned long data)
            write_list_length < WRITE_CACHE_SIZE)
            printk_once(KERN_ALERT "Not enough data to fill cache!");
 
+        /// time for moving data
+        for(move_out = cc->read_list.next, move_in = cc->read_list.next;
+            move_out != &cc->read_list && move_in != &cc->read_list;
+            move_out = move_out->next, move_in = move_in->next)
+        {
+            ;
+        }
+
         cc->io_count = 0;
         cc->old_io_count = 0;
+
+        cc->state = CWR_STATE_READY;
     }
 
     cc->unit_manage_timer.expires = jiffies + UNIT_MANAGE_INTERVAL * HZ;
     add_timer(&cc->unit_manage_timer);
 }
+#endif
+static inline sector_t get_cell_id(struct dm_target *dt,
+                                   struct cwr_context *cc,
+                                   struct bio *bio)
+{
+    return (bio->bi_sector - dt->begin) >> (cc->cell_size - 1);
+}
+
+static void cwr_end_io(struct bio *bio, int error)
+{
+    // @error is set by bio_endio()
+    struct cwr_bio_info *bio_info = (struct cwr_bio_info*)bio->bi_private;
+    struct bio *origin_bio = bio_info->bio;
+    struct cwr_context *cc = bio_info->cc;
+    sector_t cell_id = get_cell_id(bio_info->dt, cc, bio);
+
+    cc->cell_meta[cell_id].bio_count--;
+    if(cc->cell_meta[cell_id].bio_count == 0)
+    {
+        cc->cell_meta[cell_id].state &= !CELL_STATE_ACCESSING;
+        // the cell finshed all operations
+        if(!(cc->cell_meta[cell_id].state & CELL_STATE_MIGRATING))
+            cc->cell_meta[cell_id].state = CELL_STATE_READY;
+    }
+
+    bio_endio(origin_bio, error);
+    mempool_free(bio_info, bio_info_pool);
+}
 
 static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
 {
     struct cwr_context* cc = (struct cwr_context*)dt->private;
-    sector_t offset, unit_index, seek_distance;
+    sector_t cell_id, seek_distance;
     int read_flag, write_flag;
     unsigned int z_value;
+    struct bio *cwr_bio;
+    struct cwr_bio_info *bio_info;
 
-    offset = bio->bi_sector - dt->begin;
-    unit_index = offset >> (cc->unit_size - 1);
-    // is seek_distance an absolute value?
-    seek_distance = cc->last_unit - unit_index;
+    // no need to protect io_count against race condition,
+    // it could be imprecisely.
+    cc->io_count++;
+
+    read_flag = bio_data_dir(bio) & READ;
+    write_flag = bio_data_dir(bio) & WRITE;
+
+    cell_id = get_cell_id(dt, cc, bio);
+
+    /* update z value */
+    seek_distance = cc->last_cell - cell_id;
+    // make seek_distance an absolute value
     if(seek_distance < 0) seek_distance = -seek_distance;
-
-    read_flag = bio->bi_rw & READ;
-    write_flag = bio->bi_rw & WRITE;
-
-    // if seek distance is small, we consider it as sequential IO.
     if(seek_distance < 5)
-    {
+    {   // if seek distance is small, we consider it as sequential IO.
         z_value = 0;
     }
     else
     {
-        z_value = K - cc->unit_size;
+        z_value = K - cc->cell_size;
         if(z_value < 0) z_value = 0;
         z_value = z_value * (read_flag + write_flag * T);
         do_div(z_value, K); // do_div: int64/int32
@@ -360,25 +188,41 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
         do_div(seek_distance, T2);
         z_value = (T1 + seek_distance) << z_value;
     }
+    cc->cell_meta[cell_id].z_value += z_value;
 
-    cc->unit_meta[unit_index].read_count += read_flag;
-    cc->unit_meta[unit_index].write_count += write_flag;
-    cc->unit_meta[unit_index].z_value += z_value;
+    /* update r/w count */
+    cc->cell_meta[cell_id].read_count += read_flag;
+    cc->cell_meta[cell_id].write_count += write_flag;
 
-    // wait if data block is moving
-    if(cc->unit_meta[unit_index].state != UNIT_STATE_READY)
-        wait_event(wait_queue,
-                   cc->unit_meta[unit_index].state == UNIT_STATE_READY);
+    bio->bi_bdev = cc->cell_meta[cell_id].dev->bdev;
+    bio->bi_sector = cc->cell_meta[cell_id].offset * cc->cell_size;
 
-   // we don't need to protect io count against race condition,
-   // as we don't need to perform swap action precisely.
-   cc->io_count++;
+    /* clone bio to handle cell states */
+    cwr_bio = bio_clone(bio, GFP_NOIO);
+    if(cwr_bio == 0) return DM_MAPIO_REQUEUE; // try again later
+    // memory freed in cwr_end_io()
+    bio_info = (struct cwr_bio_info *)mempool_alloc(bio_info_pool, GFP_NOIO);
 
-   /// FIXME! bio may cross multiple units and should be splitted
-    bio->bi_bdev = cc->unit_meta[unit_index].dev->bdev;
-    bio->bi_sector = cc->unit_meta[unit_index].offset * cc->unit_size;
+    bio_info->bio = bio;
+    bio_info->dt = dt;
+    bio_info->cc = cc;
 
-    return DM_MAPIO_REMAPPED;
+    cwr_bio->bi_end_io = cwr_end_io;
+    cwr_bio->bi_private = bio_info;
+
+    cc->cell_meta[cell_id].state &= !CELL_STATE_READY;
+    cc->cell_meta[cell_id].state |= CELL_STATE_ACCESSING;
+    cc->cell_meta[cell_id].bio_count++;
+    if(cc->cell_meta[cell_id].state & CELL_STATE_MIGRATING)
+    {
+        ;
+    }
+    else
+    {
+        generic_make_request(cwr_bio);
+    }
+
+    return DM_MAPIO_SUBMITTED;
 }
 
 /*
@@ -388,49 +232,38 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
 static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
 {
     struct cwr_context* cc;
+    sector_t cell_size, cell_amount;
     int re = 0;
-    int unit_amount, i, j;
+    unsigned int i, j;
 
     if(argc != 4)
     {
-        dt->error = "dm-cwr: invalid argument count";
+        dt->error = "cwr: invalid argument count";
         return -EINVAL;
     }
 
-    cc = kzalloc(sizeof(struct cwr_context), GFP_KERNEL);
+    if(sscanf(argv[0], "%llu", &cell_size) != 1)
+    {
+        dt->error = "cwr: cell size read error";
+        return -EINVAL;
+    }
+    if(is_power_of_2(cell_size) == 0)
+    {
+        dt->error = "cwr: cell size is not power of 2";
+        return -EINVAL;
+    }
+    cell_amount = dt->len >> ilog2(cell_size);
+
+    cc = kzalloc(sizeof(struct cwr_context) +
+                 sizeof(struct cwr_cell_meta) * cell_amount,
+                 GFP_KERNEL);
     if(cc == 0)
     {
-        dt->error = "dm-cwr: cannot allocate cwr context";
+        dt->error = "cwr: cannot allocate cwr context";
         return -ENOMEM;
     }
 
-    /// read devices' sector sizes
-    if(sscanf(argv[0], "%llu", &cc->unit_size) != 1)
-    {
-        dt->error = "dm-cwr: unit size read error";
-        re = -EINVAL;
-        goto unit_invalid;
-    }
-    if(is_power_of_2(cc->unit_size) == 0)
-    {
-        dt->error = "dm-cwr: unit size is not power of 2";
-        re = -EINVAL;
-        goto unit_invalid;
-    }
-    unit_amount = dt->len >> ilog2(cc->unit_size);
-
-    cc->write_dev_size = WRITE_CACHE_SIZE * cc->unit_size;
-    cc->read_dev_size = READ_CACHE_SIZE * cc->unit_size;
-    cc->cold_dev_size = dt->len - cc->write_dev_size - cc->read_dev_size;
-
-    cc->unit_meta = kzalloc(sizeof(struct cwr_unit_meta) * unit_amount,
-                            GFP_KERNEL);
-    if(cc->unit_meta == 0)
-    {
-        dt->error = "dm-cwr: cannot allocate cwr unit meta";
-        re = -ENOMEM;
-        goto meta_invalid;
-    }
+    cc->cell_size = cell_size;
 
     /// get mapped targets
     re |= dm_get_device(dt, argv[1], 0, cc->cold_dev_size,
@@ -441,71 +274,78 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
                         dm_table_get_mode(dt->table), &cc->read_dev);
     if(re != 0) goto device_invalid;
 
+    cc->write_dev_size = WRITE_CACHE_SIZE * cc->cell_size;
+    cc->read_dev_size = READ_CACHE_SIZE * cc->cell_size;
+    cc->cold_dev_size = dt->len - cc->write_dev_size - cc->read_dev_size;
+
     // disk size check
-    if((i_size_read(cc->cold_dev->bdev->bd_inode) > (cc->cold_dev_size << 9))
-    || (i_size_read(cc->write_dev->bdev->bd_inode) > (cc->write_dev_size << 9))
-    || (i_size_read(cc->read_dev->bdev->bd_inode) > (cc->read_dev_size << 9)))
-    {   // i_size_read returns the size measured by bytes
-        dt->error = "dm-cwr: disk is too small";
+    // i_size_read returns device size by bytes
+    if((i_size_read(cc->cold_dev->bdev->bd_inode) < (cc->cold_dev_size << 9))
+    || (i_size_read(cc->write_dev->bdev->bd_inode) < (cc->write_dev_size << 9))
+    || (i_size_read(cc->read_dev->bdev->bd_inode) < (cc->read_dev_size << 9)))
+    {
+        dt->error = "cwr: disk is too small";
         re = -EINVAL;
+        goto size_invalid;
     }
-    // alignment check
-    if((cc->cold_dev_size & (cc->unit_size - 1))
-    || (cc->write_dev_size & (cc->unit_size - 1))
-    || (cc->read_dev_size & (cc->unit_size - 1)))
+    // alignment check (may be reduntant)
+    if((cc->cold_dev_size & (cc->cell_size - 1))
+    || (cc->write_dev_size & (cc->cell_size - 1))
+    || (cc->read_dev_size & (cc->cell_size - 1)))
     {
         dt->error = "dm-cwr: disk size is not alignt";
         re = -EINVAL;
+        goto size_invalid;
     }
-    if(re != 0) goto size_invalid;
 
-    cc->last_unit = 0;
-    cc->io_count = 0;
-    cc->state = CWR_STATE_READY;
-
-    init_timer(&cc->unit_manage_timer);
-    cc->unit_manage_timer.data = (unsigned long)cc;
-    cc->unit_manage_timer.function = manage_unit;
-    cc->unit_manage_timer.expires = jiffies + UNIT_MANAGE_INTERVAL * HZ;
-    add_timer(&cc->unit_manage_timer);
+    cc->cell_meta = (struct cwr_cell_meta *)
+                    ((unsigned char *)cc + sizeof(struct cwr_context));
 
     INIT_LIST_HEAD(&cc->read_list);
     INIT_LIST_HEAD(&cc->write_list);
     i = 0;
-    // map first part to read cache
-    for(j = 0; j < READ_CACHE_SIZE; i++, j++)
-    {
-        cc->unit_meta[i].dev = cc->read_dev;
-        cc->unit_meta[i].offset = j;
-
-        INIT_LIST_HEAD(&cc->unit_meta[i].list);
-        list_add(&cc->unit_meta[i].list, &cc->read_list);
-    }
-    // map second part to write cache
+    // map first logical part to write cache
     for(j = 0; j < WRITE_CACHE_SIZE; i++, j++)
     {
-        cc->unit_meta[i].dev = cc->write_dev;
-        cc->unit_meta[i].offset = j;
-        cc->unit_meta[i].state = UNIT_STATE_READY;
+        cc->cell_meta[i].dev = cc->write_dev;
+        cc->cell_meta[i].offset = j;
+        cc->cell_meta[i].state = CELL_STATE_READY;
 
-        INIT_LIST_HEAD(&cc->unit_meta[i].list);
-        list_add(&cc->unit_meta[i].list, &cc->write_list);
+        INIT_LIST_HEAD(&cc->cell_meta[i].rw_list);
+        list_add(&cc->cell_meta[i].rw_list, &cc->write_list);
     }
-    // map last part to cold hdd
-    for(j = 0; i < unit_amount; i++, j++)
+    // map second logical part to read cache
+    for(j = 0; j < READ_CACHE_SIZE; i++, j++)
     {
-        cc->unit_meta[i].dev = cc->cold_dev;
-        cc->unit_meta[i].offset = j;
+        cc->cell_meta[i].dev = cc->read_dev;
+        cc->cell_meta[i].offset = j;
+        cc->cell_meta[i].state = CELL_STATE_READY;
 
-        INIT_LIST_HEAD(&cc->unit_meta[i].list);
-        // initially add all nodes to read list
-        list_add(&cc->unit_meta[i].list, &cc->write_list);
+        INIT_LIST_HEAD(&cc->cell_meta[i].rw_list);
+        list_add(&cc->cell_meta[i].rw_list, &cc->read_list);
     }
+    // map last logical part to cold hdd
+    for(j = 0; i < cell_amount; i++, j++)
+    {
+        cc->cell_meta[i].dev = cc->cold_dev;
+        cc->cell_meta[i].offset = j;
+        cc->cell_meta[i].state = CELL_STATE_READY;
+
+        INIT_LIST_HEAD(&cc->cell_meta[i].rw_list);
+        // conside it as write oriented data
+        list_add(&cc->cell_meta[i].rw_list, &cc->write_list);
+    }
+
+    /*init_timer(&cc->cell_manage_timer);
+    cc->cell_manage_timer.data = (unsigned long)cc;
+    cc->cell_manage_timer.function = cell_manager;
+    cc->cell_manage_timer.expires = jiffies + CELL_MANAGE_INTERVAL * HZ;
+    add_timer(&cc->cell_manage_timer);*/
 
     dt->private = cc;
 
-    printk(KERN_DEBUG "a new cwr device is constructed.");
-    printk(KERN_DEBUG "unit size: %llu", cc->unit_size);
+    printk(KERN_DEBUG "a cwr device is constructed.");
+    printk(KERN_DEBUG "cell size: %llu", cc->cell_size);
     printk(KERN_DEBUG "c: %s, w:%s, r:%s",
            cc->cold_dev->name, cc->write_dev->name, cc->read_dev->name);
     return 0;
@@ -515,8 +355,6 @@ device_invalid:
     if(cc->cold_dev) dm_put_device(dt, cc->cold_dev);
     if(cc->write_dev) dm_put_device(dt, cc->write_dev);
     if(cc->read_dev) dm_put_device(dt, cc->read_dev);
-meta_invalid:
-unit_invalid:
     kfree(cc);
     return re;
 }
@@ -525,10 +363,12 @@ static void cwr_dtr(struct dm_target *dt)
 {
     struct cwr_context* cc = (struct cwr_context*)dt->private;
 
+    /*// wait until the last timer returns
+    del_timer_sync(&cc->cell_manage_timer);*/
+
     dm_put_device(dt, cc->cold_dev);
     dm_put_device(dt, cc->write_dev);
     dm_put_device(dt, cc->read_dev);
-    kfree(cc->unit_meta);
     kfree(cc);
 
     printk(KERN_DEBUG "a cwr device is destructed.");
@@ -550,9 +390,24 @@ static int __init cwr_init(void)
 {
     int re;
 
+    /* init bio info pool */
+    bio_info_cache = kmem_cache_create("cwr_bio_info",
+                                       sizeof(struct cwr_bio_info),
+                                       0, 0, 0);
+    if(bio_info_cache == 0)
+    {
+        printk(KERN_ERR "allocate bio info cache fail.");
+        return -ENOMEM;
+    }
+    bio_info_pool = mempool_create(MIN_BIO_INFO_AMOUNT,
+                                   mempool_alloc_slab, mempool_free_slab,
+                                   bio_info_cache);
+
     re = dm_register_target(&cwr_target);
     if(re < 0)
     {
+        mempool_destroy(bio_info_pool);
+        kmem_cache_destroy(bio_info_cache);
         printk(KERN_ERR "regist cwr target fail.");
         return re;
     }
@@ -564,7 +419,9 @@ static int __init cwr_init(void)
 static void __exit cwr_done(void)
 {
     dm_unregister_target(&cwr_target);
-    printk(KERN_DEBUG "cwr unloaded.");
+    mempool_destroy(bio_info_pool);
+    kmem_cache_destroy(bio_info_cache);
+    printk(KERN_DEBUG "cwr exited.");
 }
 
 module_init(cwr_init);
