@@ -52,8 +52,10 @@
 
 struct cwr_swap_info
 {
-    sector_t cell_id1;
-    sector_t cell_id2;
+    struct cwr_cell_meta *cell_meta1;
+    struct cwr_cell_meta *cell_meta2;
+    struct cwr_context *cc;
+    struct list_head swap_list;
 };
 
 struct cwr_bio_info
@@ -105,6 +107,7 @@ struct cwr_context
 
     unsigned int state;
     unsigned int swap_count;
+    struct work_struct swap_work;
 
     struct timer_list cell_manage_timer; // for cell management
 };

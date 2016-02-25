@@ -3,12 +3,36 @@
 static struct kmem_cache *bio_info_cache;
 static mempool_t *bio_info_pool;
 
-static inline void swap_cell(sector_t cell_id1, sector_t cell_id2)
+LIST_HEAD(swap_list);
+struct workqueue_struct *swap_work_queue;
+
+static void swap_worker(struct work_struct *ws)
 {
     ;
 }
 
-static inline void pair_n_swap(struct cwr_context *cc)
+static inline void enqueue_pair(struct cwr_cell_meta *cell_meta1,
+                                struct cwr_cell_meta *cell_meta2,
+                                struct cwr_context *cc)
+{
+    struct cwr_swap_info *swap_info;
+
+    swap_info = kzalloc(sizeof(struct cwr_swap_info), GFP_ATOMIC);
+    if(swap_info == 0) return;
+
+    swap_info->cell_meta1 = cell_meta1;
+    swap_info->cell_meta2 = cell_meta2;
+    swap_info->cc = cc;
+    INIT_LIST_HEAD(&swap_info->swap_list);
+
+    // swap info will be used by worker of work queue
+    list_add_tail(&swap_info->swap_list, &swap_list);
+    queue_work(swap_work_queue, &cc->swap_work);
+
+    cc->swap_count++;
+}
+
+static inline void enqueue_pairs(struct cwr_context *cc)
 {
     struct list_head wc_node, cw_node, wr_node, rw_node, rc_node, cr_node;
     struct list_head *cur_node, *next_node, *swap_node1, *swap_node2;
@@ -68,21 +92,21 @@ static inline void pair_n_swap(struct cwr_context *cc)
     for(swap_node1 = wc_node.next, swap_node2 = cw_node.next;
         swap_node1->next != &wc_node && swap_node2 != &cw_node;
         swap_node1 = swap_node1->next, swap_node2 = swap_node2->next)
-    {
-        cc->swap_count++;
-    }
+        enqueue_pair(list_entry(swap_node1, struct cwr_cell_meta, class_list),
+                    list_entry(swap_node2, struct cwr_cell_meta, class_list),
+                    cc);
     for(swap_node1 = rc_node.next, swap_node2 = cr_node.next;
         swap_node1->next != &rc_node && swap_node2 != &cr_node;
         swap_node1 = swap_node1->next, swap_node2 = swap_node2->next)
-    {
-        cc->swap_count++;
-    }
+        enqueue_pair(list_entry(swap_node1, struct cwr_cell_meta, class_list),
+                    list_entry(swap_node2, struct cwr_cell_meta, class_list),
+                    cc);
     for(swap_node1 = wr_node.next, swap_node2 = rw_node.next;
         swap_node1->next != &wr_node && swap_node2 != &rw_node;
         swap_node1 = swap_node1->next, swap_node2 = swap_node2->next)
-    {
-        cc->swap_count++;
-    }
+        enqueue_pair(list_entry(swap_node1, struct cwr_cell_meta, class_list),
+                    list_entry(swap_node2, struct cwr_cell_meta, class_list),
+                    cc);
 
     list_for_each_safe(cur_node, next_node, &wc_node) list_del_init(cur_node);
     list_for_each_safe(cur_node, next_node, &cw_node) list_del_init(cur_node);
@@ -184,12 +208,12 @@ static void cell_manager(unsigned long data)
          *   1. w -> c; 2. c -> w;
          *   3. w -> r; 4. r -> w;
          *   5. c -> r; 6. r -> c;
-         * then we can pair them for migration
+         * then we can pair them to work queue for migration
          * some cells won't be migrated:
          *   1. it's in accessing
          *   2. we can't find a pair for it
          */
-        pair_n_swap(cc);
+        enqueue_pairs(cc);
 
         cc->io_count = 0;
         cc->old_io_count = 0;
@@ -418,6 +442,8 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
         list_add(&cc->cell_meta[i].rw_list, &cc->write_list);
     }
 
+    INIT_WORK(&cc->swap_work, swap_worker);
+
     init_timer(&cc->cell_manage_timer);
     cc->cell_manage_timer.data = (unsigned long)cc;
     cc->cell_manage_timer.function = cell_manager;
@@ -445,8 +471,7 @@ static void cwr_dtr(struct dm_target *dt)
 {
     struct cwr_context *cc = (struct cwr_context*)dt->private;
 
-    /*// wait until the last timer returns
-    del_timer_sync(&cc->cell_manage_timer);*/
+    flush_workqueue(swap_work_queue);
 
     dm_put_device(dt, cc->cold_dev);
     dm_put_device(dt, cc->write_dev);
@@ -485,22 +510,37 @@ static int __init cwr_init(void)
                                    mempool_alloc_slab, mempool_free_slab,
                                    bio_info_cache);
 
+    swap_work_queue = create_workqueue("CWR_WORK_QUEUE");
+    if(swap_work_queue == 0)
+    {
+        printk(KERN_ERR "create work queue fail.");
+        re = -ENOMEM;
+        goto work_queue_fail;
+    }
+
     re = dm_register_target(&cwr_target);
     if(re < 0)
     {
-        mempool_destroy(bio_info_pool);
-        kmem_cache_destroy(bio_info_cache);
         printk(KERN_ERR "regist cwr target fail.");
-        return re;
+        goto register_target_fail;
     }
 
     printk(KERN_DEBUG "cwr loaded.");
     return 0;
+
+register_target_fail:
+    destroy_workqueue(swap_work_queue);
+work_queue_fail:
+    mempool_destroy(bio_info_pool);
+    kmem_cache_destroy(bio_info_cache);
+
+    return re;
 }
 
 static void __exit cwr_done(void)
 {
     dm_unregister_target(&cwr_target);
+    destroy_workqueue(swap_work_queue);
     mempool_destroy(bio_info_pool);
     kmem_cache_destroy(bio_info_cache);
     printk(KERN_DEBUG "cwr exited.");
