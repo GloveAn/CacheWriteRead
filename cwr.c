@@ -3,10 +3,15 @@
 static struct kmem_cache *bio_info_cache;
 static mempool_t *bio_info_pool;
 
+static inline void swap_cell(sector_t cell_id1, sector_t cell_id2)
+{
+    ;
+}
+
 static inline void pair_n_swap(struct cwr_context *cc)
 {
     struct list_head wc_node, cw_node, wr_node, rw_node, rc_node, cr_node;
-    struct list_head *cur_node;
+    struct list_head *cur_node, *next_node, *swap_node1, *swap_node2;
     struct cwr_cell_meta *cur_cell;
     unsigned int i;
 
@@ -60,7 +65,31 @@ static inline void pair_n_swap(struct cwr_context *cc)
         i++;
     }
 
-    ;
+    for(swap_node1 = wc_node.next, swap_node2 = cw_node.next;
+        swap_node1->next != &wc_node && swap_node2 != &cw_node;
+        swap_node1 = swap_node1->next, swap_node2 = swap_node2->next)
+    {
+        cc->swap_count++;
+    }
+    for(swap_node1 = rc_node.next, swap_node2 = cr_node.next;
+        swap_node1->next != &rc_node && swap_node2 != &cr_node;
+        swap_node1 = swap_node1->next, swap_node2 = swap_node2->next)
+    {
+        cc->swap_count++;
+    }
+    for(swap_node1 = wr_node.next, swap_node2 = rw_node.next;
+        swap_node1->next != &wr_node && swap_node2 != &rw_node;
+        swap_node1 = swap_node1->next, swap_node2 = swap_node2->next)
+    {
+        cc->swap_count++;
+    }
+
+    list_for_each_safe(cur_node, next_node, &wc_node) list_del_init(cur_node);
+    list_for_each_safe(cur_node, next_node, &cw_node) list_del_init(cur_node);
+    list_for_each_safe(cur_node, next_node, &rc_node) list_del_init(cur_node);
+    list_for_each_safe(cur_node, next_node, &cr_node) list_del_init(cur_node);
+    list_for_each_safe(cur_node, next_node, &rw_node) list_del_init(cur_node);
+    list_for_each_safe(cur_node, next_node, &wr_node) list_del_init(cur_node);
 }
 
 static int list_sort_cmp(void *priv, struct list_head* a, struct list_head* b)
@@ -90,9 +119,12 @@ static void cell_manager(unsigned long data)
     io_frenquency = (cc->io_count - cc->old_io_count) / CELL_MANAGE_INTERVAL;
     cc->old_io_count = cc->io_count;
 
-    if(cc->io_count >= IO_COUNT_THRESHOLD &&
+    if(cc->state == CWR_STATE_MIGRATING &&
+       cc->io_count >= IO_COUNT_THRESHOLD &&
        io_frenquency <= CELL_MANAGE_THRESHOLD)
     {
+        cc->state = CWR_STATE_MIGRATING;
+
         /* clear read count and write count to prevent overflow */
         list_for_each(cur_node, &cc->read_list)
         {

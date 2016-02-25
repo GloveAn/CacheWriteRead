@@ -43,8 +43,18 @@
 #define CELL_STATE_ACCESSING 1 << 1
 #define CELL_STATE_MIGRATING 1 << 2
 
+/* cwr state for migration */
+#define CWR_STATE_READY     1 << 0
+#define CWR_STATE_MIGRATING 1 << 1
+
 /* bio info minimal available amount */
 #define MIN_BIO_INFO_AMOUNT 256
+
+struct cwr_swap_info
+{
+    sector_t cell_id1;
+    sector_t cell_id2;
+};
 
 struct cwr_bio_info
 {
@@ -92,6 +102,9 @@ struct cwr_context
 
     unsigned int io_count;
     unsigned int old_io_count; // for calculating io frequency
+
+    unsigned int state;
+    unsigned int swap_count;
 
     struct timer_list cell_manage_timer; // for cell management
 };
