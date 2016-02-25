@@ -3,16 +3,73 @@
 static struct kmem_cache *bio_info_cache;
 static mempool_t *bio_info_pool;
 
-#if 0
-static DECLARE_WAIT_QUEUE_HEAD(wait_queue);
-#endif
+static inline void pair_n_swap(struct cwr_context *cc)
+{
+    struct list_head wc_node, cw_node, wr_node, rw_node, rc_node, cr_node;
+    struct list_head *cur_node;
+    struct cwr_cell_meta *cur_cell;
+    unsigned int i;
+
+    INIT_LIST_HEAD(&wc_node);
+    INIT_LIST_HEAD(&cw_node);
+    INIT_LIST_HEAD(&wr_node);
+    INIT_LIST_HEAD(&rw_node);
+    INIT_LIST_HEAD(&rc_node);
+    INIT_LIST_HEAD(&cr_node);
+
+    /* cell classify */
+    i = 0;
+    list_for_each(cur_node, &cc->read_list)
+    {
+        cur_cell = list_entry(cur_node, struct cwr_cell_meta, rw_list);
+
+        if(cur_cell->state & CELL_STATE_ACCESSING) continue;
+        if(i < READ_CACHE_SIZE)
+        {
+            if(cur_cell->dev == cc->cold_dev) // c -> r
+                list_add(&cur_cell->class_list, &cr_node);
+            if(cur_cell->dev == cc->write_dev) // w -> r
+                list_add(&cur_cell->class_list, &wr_node);
+        }
+        else // r -> c
+        {
+            if(cur_cell->dev == cc->read_dev)
+                list_add(&cur_cell->class_list, &rc_node);
+        }
+        i++;
+    }
+
+    i = 0;
+    list_for_each(cur_node, &cc->write_list)
+    {
+        cur_cell = list_entry(cur_node, struct cwr_cell_meta, rw_list);
+
+        if(cur_cell->state & CELL_STATE_ACCESSING) continue;
+        if(i < WRITE_CACHE_SIZE)
+        {
+            if(cur_cell->dev == cc->cold_dev) // c -> w
+                list_add(&cur_cell->class_list, &cw_node);
+            if(cur_cell->dev == cc->read_dev) // r -> w
+                list_add(&cur_cell->class_list, &rw_node);
+        }
+        else // w -> c
+        {
+            if(cur_cell->dev == cc->write_dev)
+                list_add(&cur_cell->class_list, &wc_node);
+        }
+        i++;
+    }
+
+    ;
+}
+
 static int list_sort_cmp(void *priv, struct list_head* a, struct list_head* b)
 {
     /*
      * The comparison function @cmp must return a negative value if @a
      * should sort before @b
     */
-    struct cwr_cell_meta* cell_meta_a, * cell_meta_b;
+    struct cwr_cell_meta *cell_meta_a, *cell_meta_b;
     cell_meta_a = list_entry(a, struct cwr_cell_meta, rw_list);
     cell_meta_b = list_entry(b, struct cwr_cell_meta, rw_list);
     if(cell_meta_a->z_value == cell_meta_b->z_value) return 0;
@@ -26,10 +83,8 @@ static void cell_manager(unsigned long data)
      * so no worry about concurrency.
      */
     struct cwr_context *cc = (struct cwr_context *)data;
-    struct list_head *cur_node, *next_node, *move_out, *move_in;
-    struct cwr_cell_meta* cur_cell;
-    unsigned int read_list_length = 0;
-    unsigned int write_list_length = 0;
+    struct list_head *cur_node, *next_node;
+    struct cwr_cell_meta *cur_cell;
     unsigned int io_frenquency;
 
     io_frenquency = (cc->io_count - cc->old_io_count) / CELL_MANAGE_INTERVAL;
@@ -77,10 +132,6 @@ static void cell_manager(unsigned long data)
                 list_del_init(cur_node);
                 list_add(cur_node, &cc->write_list);
             }
-            else
-            {
-                read_list_length++;
-            }
         }
         list_for_each_safe(cur_node, next_node, &cc->write_list)
         {
@@ -90,29 +141,23 @@ static void cell_manager(unsigned long data)
                 list_del_init(cur_node);
                 list_add(cur_node, &cc->read_list);
             }
-            else
-            {
-                write_list_length++;
-            }
         }
 
         /* sort hot cells to the front of lists */
         list_sort(0, &cc->read_list, list_sort_cmp);
         list_sort(0, &cc->write_list, list_sort_cmp);
 
-        /// FIXME! consider no data block is marked read or write,
-        /// then the the device cannot hold all the data.
-        if(read_list_length < READ_CACHE_SIZE ||
-           write_list_length < WRITE_CACHE_SIZE)
-           printk_once(KERN_ALERT "Not enough data to fill cache!");
-
-        /// time for moving data
-        /*for(move_out = cc->read_list.next, move_in = cc->read_list.next;
-            move_out != &cc->read_list && move_in != &cc->read_list;
-            move_out = move_out->next, move_in = move_in->next)
-        {
-            ;
-        }*/
+        /* traverse read list and write list
+         * to classify cells into 6 categoris:
+         *   1. w -> c; 2. c -> w;
+         *   3. w -> r; 4. r -> w;
+         *   5. c -> r; 6. r -> c;
+         * then we can pair them for migration
+         * some cells won't be migrated:
+         *   1. it's in accessing
+         *   2. we can't find a pair for it
+         */
+        pair_n_swap(cc);
 
         cc->io_count = 0;
         cc->old_io_count = 0;
@@ -152,7 +197,7 @@ static void cwr_end_io(struct bio *bio, int error)
 
 static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
 {
-    struct cwr_context* cc = (struct cwr_context*)dt->private;
+    struct cwr_context *cc = (struct cwr_context*)dt->private;
     sector_t cell_id, seek_distance;
     int read_flag, write_flag;
     unsigned int z_value;
@@ -230,7 +275,7 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
  */
 static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
 {
-    struct cwr_context* cc;
+    struct cwr_context *cc;
     sector_t cell_size, cell_amount;
     int re = 0;
     unsigned int i, j;
@@ -309,8 +354,10 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
         cc->cell_meta[i].dev = cc->write_dev;
         cc->cell_meta[i].offset = j;
         cc->cell_meta[i].state = CELL_STATE_READY;
-
         INIT_LIST_HEAD(&cc->cell_meta[i].rw_list);
+        INIT_LIST_HEAD(&cc->cell_meta[i].class_list);
+        bio_list_init(&cc->cell_meta[i].bio_list);
+
         list_add(&cc->cell_meta[i].rw_list, &cc->write_list);
     }
     // map second logical part to read cache
@@ -319,8 +366,10 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
         cc->cell_meta[i].dev = cc->read_dev;
         cc->cell_meta[i].offset = j;
         cc->cell_meta[i].state = CELL_STATE_READY;
-
         INIT_LIST_HEAD(&cc->cell_meta[i].rw_list);
+        INIT_LIST_HEAD(&cc->cell_meta[i].class_list);
+        bio_list_init(&cc->cell_meta[i].bio_list);
+
         list_add(&cc->cell_meta[i].rw_list, &cc->read_list);
     }
     // map last logical part to cold hdd
@@ -329,8 +378,10 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
         cc->cell_meta[i].dev = cc->cold_dev;
         cc->cell_meta[i].offset = j;
         cc->cell_meta[i].state = CELL_STATE_READY;
-
         INIT_LIST_HEAD(&cc->cell_meta[i].rw_list);
+        INIT_LIST_HEAD(&cc->cell_meta[i].class_list);
+        bio_list_init(&cc->cell_meta[i].bio_list);
+
         // conside it as write oriented data
         list_add(&cc->cell_meta[i].rw_list, &cc->write_list);
     }
@@ -360,7 +411,7 @@ device_invalid:
 
 static void cwr_dtr(struct dm_target *dt)
 {
-    struct cwr_context* cc = (struct cwr_context*)dt->private;
+    struct cwr_context *cc = (struct cwr_context*)dt->private;
 
     /*// wait until the last timer returns
     del_timer_sync(&cc->cell_manage_timer);*/

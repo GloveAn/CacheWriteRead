@@ -10,6 +10,7 @@
 
 // NOTE: sector_t = u64 = unsigned long long
 
+/* unit in cell */
 #define WRITE_CACHE_SIZE 200
 #define READ_CACHE_SIZE  200
 
@@ -67,6 +68,7 @@ struct cwr_cell_meta
     unsigned int state;
 
     struct list_head rw_list; // list for sorting by data hotness / z value
+    struct list_head class_list; // list for migration
     struct bio_list bio_list; // list for waiting for migration
 };
 
