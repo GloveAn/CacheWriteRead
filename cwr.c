@@ -215,7 +215,8 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     cc->cell_meta[cell_id].bio_count++;
     if(cc->cell_meta[cell_id].state & CELL_STATE_MIGRATING)
     {
-        ;
+        // pend bio when migrating
+        bio_list_add(&cc->cell_meta[cell_id].bio_list, cwr_bio);
     }
     else
     {
