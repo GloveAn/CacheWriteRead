@@ -5,74 +5,74 @@ static mempool_t *bio_info_pool;
 
 #if 0
 static DECLARE_WAIT_QUEUE_HEAD(wait_queue);
-
+#endif
 static int list_sort_cmp(void *priv, struct list_head* a, struct list_head* b)
 {
     /*
      * The comparison function @cmp must return a negative value if @a
      * should sort before @b
     */
-    struct cwr_unit_meta* unit_meta_a, * unit_meta_b;
-    unit_meta_a = list_entry(a, struct cwr_unit_meta, list);
-    unit_meta_b = list_entry(b, struct cwr_unit_meta, list);
-    if(unit_meta_a->z_value == unit_meta_b->z_value) return 0;
-    return unit_meta_a->z_value < unit_meta_b->z_value;
+    struct cwr_cell_meta* cell_meta_a, * cell_meta_b;
+    cell_meta_a = list_entry(a, struct cwr_cell_meta, rw_list);
+    cell_meta_b = list_entry(b, struct cwr_cell_meta, rw_list);
+    if(cell_meta_a->z_value == cell_meta_b->z_value) return 0;
+    return cell_meta_a->z_value < cell_meta_b->z_value;
 }
 
-static void manage_unit(unsigned long data)
+static void cell_manager(unsigned long data)
 {
+    /* as the timer is set when this function returns,
+     * there will be at most one timer running.
+     * so no worry about concurrency.
+     */
     struct cwr_context *cc = (struct cwr_context *)data;
     struct list_head *cur_node, *next_node, *move_out, *move_in;
-    struct cwr_unit_meta* cur_unit;
+    struct cwr_cell_meta* cur_cell;
     unsigned int read_list_length = 0;
     unsigned int write_list_length = 0;
     unsigned int io_frenquency;
 
-    io_frenquency = (cc->io_count - cc->old_io_count) / UNIT_MANAGE_INTERVAL;
+    io_frenquency = (cc->io_count - cc->old_io_count) / CELL_MANAGE_INTERVAL;
     cc->old_io_count = cc->io_count;
 
-    // if the cwr device is already under data moving state, we should quit
-    if(cc->state != CWR_STATE_MOVING &&
-       cc->io_count >= IO_COUNT_THRESHOLD &&
-       io_frenquency == UNIT_MANAGE_THRESHOLD)
+    if(cc->io_count >= IO_COUNT_THRESHOLD &&
+       io_frenquency <= CELL_MANAGE_THRESHOLD)
     {
-        cc->state = CWR_STATE_MOVING;
-
-        /// clear read count and write count to prevent overflow
+        /* clear read count and write count to prevent overflow */
         list_for_each(cur_node, &cc->read_list)
         {
-	        cur_unit = list_entry(cur_node, struct cwr_unit_meta, list);
-            if(cur_unit->read_count > cur_unit->write_count)
+	        cur_cell = list_entry(cur_node, struct cwr_cell_meta, rw_list);
+            if(cur_cell->read_count > cur_cell->write_count)
             {
-                cur_unit->read_count -= cur_unit->write_count;
-                cur_unit->write_count = 0;
+                cur_cell->read_count -= cur_cell->write_count;
+                cur_cell->write_count = 0;
             }
             else
             {
-                cur_unit->write_count -= cur_unit->read_count;
-                cur_unit->read_count = 0;
+                cur_cell->write_count -= cur_cell->read_count;
+                cur_cell->read_count = 0;
             }
 	    }
         list_for_each(cur_node, &cc->write_list)
         {
-	        cur_unit = list_entry(cur_node, struct cwr_unit_meta, list);
-            if(cur_unit->read_count > cur_unit->write_count)
+	        cur_cell = list_entry(cur_node, struct cwr_cell_meta, rw_list);
+            if(cur_cell->read_count > cur_cell->write_count)
             {
-                cur_unit->read_count -= cur_unit->write_count;
-                cur_unit->write_count = 0;
+                cur_cell->read_count -= cur_cell->write_count;
+                cur_cell->write_count = 0;
             }
             else
             {
-                cur_unit->write_count -= cur_unit->read_count;
-                cur_unit->read_count = 0;
+                cur_cell->write_count -= cur_cell->read_count;
+                cur_cell->read_count = 0;
             }
 	    }
 
-        /// arrange list node by its read count and write count
+        /* arrange list node by its read count and write count */
         list_for_each_safe(cur_node, next_node, &cc->read_list)
         {
-            cur_unit = list_entry(cur_node, struct cwr_unit_meta, list);
-            if(cur_unit->write_count > RW_STATE_THRESHOLD)
+            cur_cell = list_entry(cur_node, struct cwr_cell_meta, rw_list);
+            if(cur_cell->write_count > RW_STATE_THRESHOLD)
             {
                 list_del_init(cur_node);
                 list_add(cur_node, &cc->write_list);
@@ -84,8 +84,8 @@ static void manage_unit(unsigned long data)
         }
         list_for_each_safe(cur_node, next_node, &cc->write_list)
         {
-            cur_unit = list_entry(cur_node, struct cwr_unit_meta, list);
-            if(cur_unit->read_count > RW_STATE_THRESHOLD)
+            cur_cell = list_entry(cur_node, struct cwr_cell_meta, rw_list);
+            if(cur_cell->read_count > RW_STATE_THRESHOLD)
             {
                 list_del_init(cur_node);
                 list_add(cur_node, &cc->read_list);
@@ -96,7 +96,7 @@ static void manage_unit(unsigned long data)
             }
         }
 
-        /// sort hot data to the front of lists
+        /* sort hot cells to the front of lists */
         list_sort(0, &cc->read_list, list_sort_cmp);
         list_sort(0, &cc->write_list, list_sort_cmp);
 
@@ -107,23 +107,21 @@ static void manage_unit(unsigned long data)
            printk_once(KERN_ALERT "Not enough data to fill cache!");
 
         /// time for moving data
-        for(move_out = cc->read_list.next, move_in = cc->read_list.next;
+        /*for(move_out = cc->read_list.next, move_in = cc->read_list.next;
             move_out != &cc->read_list && move_in != &cc->read_list;
             move_out = move_out->next, move_in = move_in->next)
         {
             ;
-        }
+        }*/
 
         cc->io_count = 0;
         cc->old_io_count = 0;
-
-        cc->state = CWR_STATE_READY;
     }
 
-    cc->unit_manage_timer.expires = jiffies + UNIT_MANAGE_INTERVAL * HZ;
-    add_timer(&cc->unit_manage_timer);
+    cc->cell_manage_timer.expires = jiffies + CELL_MANAGE_INTERVAL * HZ;
+    add_timer(&cc->cell_manage_timer);
 }
-#endif
+
 static inline sector_t get_cell_id(struct dm_target *dt,
                                    struct cwr_context *cc,
                                    struct bio *bio)
@@ -337,11 +335,11 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
         list_add(&cc->cell_meta[i].rw_list, &cc->write_list);
     }
 
-    /*init_timer(&cc->cell_manage_timer);
+    init_timer(&cc->cell_manage_timer);
     cc->cell_manage_timer.data = (unsigned long)cc;
     cc->cell_manage_timer.function = cell_manager;
     cc->cell_manage_timer.expires = jiffies + CELL_MANAGE_INTERVAL * HZ;
-    add_timer(&cc->cell_manage_timer);*/
+    add_timer(&cc->cell_manage_timer);
 
     dt->private = cc;
 
