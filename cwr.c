@@ -67,21 +67,21 @@ static void swap_worker(struct work_struct *ws)
     cc = container_of(ws, struct cwr_context, swap_work);
     csi = list_first_entry(&swap_list, struct cwr_swap_info, swap_list);
 
-    list_del(&si->swap_list);
+    list_del(&csi->swap_list);
 
     mem1 = vmalloc(cc->cell_size << 9);
     mem2 = vmalloc(cc->cell_size << 9);
     if(mem1 == 0 || mem2 == 0) goto exit_swap;
 
     /* read cell data to memory */
-    dir1 = make_io_region(cc, si->ccm1);
+    dir1 = make_io_region(cc, csi->ccm1);
     re = dm_io_sync_vm(1, &dir1, READ, mem1, &error_bits, cc);
     if(re < 0)
     {
         printk(KERN_ERR "cwr: read cells fail.");
         goto exit_swap;
     }
-    dir2 = make_io_region(cc, si->ccm2);
+    dir2 = make_io_region(cc, csi->ccm2);
     re = dm_io_sync_vm(1, &dir2, READ, mem2, &error_bits, cc);
     if(re < 0)
     {
@@ -104,28 +104,28 @@ static void swap_worker(struct work_struct *ws)
     }
 
     /* swap meta info */
-    tmp_int = si->cell_meta1->z_value;
-    si->cell_meta1->z_value = si->cell_meta2->z_value;
-    si->cell_meta2->z_value = tmp_int;
+    tmp_int = csi->ccm1->z_value;
+    csi->ccm1->z_value = csi->ccm2->z_value;
+    csi->ccm2->z_value = tmp_int;
 
-    tmp_int = si->cell_meta1->read_count;
-    si->cell_meta1->read_count = si->cell_meta2->read_count;
-    si->cell_meta2->read_count = tmp_int;
+    tmp_int = csi->ccm1->read_count;
+    csi->ccm1->read_count = csi->ccm2->read_count;
+    csi->ccm2->read_count = tmp_int;
 
-    tmp_int = si->cell_meta1->write_count;
-    si->cell_meta1->write_count = si->cell_meta2->write_count;
-    si->cell_meta2->write_count = tmp_int;
+    tmp_int = csi->ccm1->write_count;
+    csi->ccm1->write_count = csi->ccm2->write_count;
+    csi->ccm2->write_count = tmp_int;
 
-    tmp_dev = si->cell_meta1->dev;
-    si->cell_meta1->dev = si->cell_meta2->dev;
-    si->cell_meta2->dev = tmp_dev;
+    tmp_dev = csi->ccm1->dev;
+    csi->ccm1->dev = csi->ccm2->dev;
+    csi->ccm2->dev = tmp_dev;
 
-    tmp_offset = si->cell_meta1->offset;
-    si->cell_meta1->offset = si->cell_meta2->offset;
-    si->cell_meta2->offset = tmp_offset;
+    tmp_offset = csi->ccm1->offset;
+    csi->ccm1->offset = csi->ccm2->offset;
+    csi->ccm2->offset = tmp_offset;
 
-    finish_pending_bio(cc, si->cell_meta1);
-    finish_pending_bio(cc, si->cell_meta2);
+    finish_pending_bio(cc, csi->ccm1);
+    finish_pending_bio(cc, csi->ccm2);
 
 exit_swap:
     if(mem1) vfree(mem1);
@@ -145,10 +145,10 @@ static inline void enqueue_pair(struct cwr_cell_meta *ccm1,
     csi->ccm1 = ccm1;
     csi->ccm2 = ccm2;
     csi->cc = cc;
-    INIT_LIST_HEAD(&swap_info->swap_list);
+    INIT_LIST_HEAD(&csi->swap_list);
 
     // swap info will be used by worker of work queue
-    list_add_tail(&swap_info->swap_list, &swap_list);
+    list_add_tail(&csi->swap_list, &swap_list);
     queue_work(swap_work_queue, &cc->swap_work);
 }
 
@@ -204,7 +204,7 @@ static inline void enqueue_pairs(struct cwr_context *cc)
         else // w -> c
         {
             if(ccm->dev == cc->write_dev)
-                list_add(&cur_cell->class_list, &wc_node);
+                list_add(&ccm->class_list, &wc_node);
         }
         i++;
     }
