@@ -9,7 +9,7 @@
 #include <linux/timer.h>
 #include <linux/sched.h>
 #include <linux/spinlock.h>
-#include <asm/bitops.h>
+#include <asm/atomic.h>
 
 // NOTE: sector_t = u64 = unsigned long long
 
@@ -71,7 +71,7 @@ struct cwr_cell_meta
 
     unsigned int read_count;
     unsigned int write_count;
-    unsigned int bio_count; // for managing cwr state
+    atomic_t bio_count; // for managing cwr state
 
     struct dm_dev *dev;
     sector_t offset; // physical location on device, unit in sector

@@ -267,10 +267,10 @@ static void cell_manager(unsigned long data)
     struct cwr_context *cc = (struct cwr_context *)data;
     struct list_head *cur_node, *next_node;
     struct cwr_cell_meta *ccm;
-    unsigned int io_frenquency;
-    unsigned int min_z_value = -1;
+    int io_frenquency;
+    int min_z_value = INT_MAX;
 
-    io_frenquency = (cc->io_count - cc->old_io_count) / CELL_MANAGE_INTERVAL;
+    io_frenquency = cc->io_count - cc->old_io_count / CELL_MANAGE_INTERVAL;
     cc->old_io_count = cc->io_count;
 
     // trigger under certain conditions
@@ -386,12 +386,8 @@ static void cwr_end_io(struct bio *bio, int error)
     struct cwr_context *cc = cbi->cc;
     sector_t cell_id = get_cell_id(cbi->dt, cc, bio);
 
-    spin_lock(&cc->lock);
-    cc->cell_meta[cell_id].bio_count--;
-    if(cc->cell_meta[cell_id].bio_count == 0)
-        // remove state accessing
+    if(atomic_dec_and_test(&cc->cell_meta[cell_id].bio_count))
         cc->cell_meta[cell_id].state &= !CELL_STATE_ACCESSING;
-    spin_unlock(&cc->lock);
 
     bio_endio(origin_bio, error);
     mempool_free(cbi, bio_info_pool);
@@ -402,7 +398,7 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     struct cwr_context *cc = (struct cwr_context *)dt->private;
     sector_t cell_id, seek_distance;
     int read_flag, write_flag;
-    unsigned int z_value;
+    int z_value;
     struct bio *cwr_bio;
     struct cwr_bio_info *cbi;
 
@@ -435,6 +431,7 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
         do_div(seek_distance, T2);
         z_value = (T1 + seek_distance) << z_value;
     }
+    cc->cell_meta[cell_id].z_value += z_value;
 
     /* clone bio to handle cell states */
     cwr_bio = bio_clone(bio, GFP_NOIO);
@@ -448,19 +445,17 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     cwr_bio->bi_end_io = cwr_end_io;
     cwr_bio->bi_private = cbi;
 
-    spin_lock(&cc->lock);
-
-    cc->cell_meta[cell_id].z_value += z_value;
     cc->cell_meta[cell_id].read_count += read_flag;
     cc->cell_meta[cell_id].write_count += write_flag;
-    cc->cell_meta[cell_id].bio_count++;
+    // when bio count reaches 0, we will change cwr state to ready.
+    atomic_inc(&cc->cell_meta[cell_id].bio_count);
+
+    spin_lock(&cc->lock);
 
     cc->last_cell = cell_id;
 
-    /* remove ready state, add accessing state */
     cc->cell_meta[cell_id].state |= CELL_STATE_ACCESSING;
 
-    // when bio count reaches 0, we will change cwr state to ready.
     if(cc->cell_meta[cell_id].state & CELL_STATE_MIGRATING)
     {
         // pend bio when migrating
