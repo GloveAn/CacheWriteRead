@@ -316,18 +316,18 @@ static void cell_manager(unsigned long data)
         /* clear z value,
          * migrate list node by its read count and write count
          */
-        spin_lock(&cc->lock);
-
         list_for_each_safe(cur_node, next_node, &cc->read_list)
         {
             ccm = list_entry(cur_node, struct cwr_cell_meta, rw_list);
-
-            ccm->z_value -= min_z_value;
 
             if(ccm->write_count > RW_STATE_THRESHOLD)
             {
                 list_del_init(cur_node);
                 list_add(cur_node, &cc->write_list);
+            }
+            else
+            {
+                ccm->z_value -= min_z_value;
             }
         }
         list_for_each_safe(cur_node, next_node, &cc->write_list)
@@ -342,8 +342,6 @@ static void cell_manager(unsigned long data)
                 list_add(cur_node, &cc->read_list);
             }
         }
-
-        spin_unlock(&cc->lock);
 
         /* sort hot cells to the front of lists */
         list_sort(0, &cc->read_list, list_sort_cmp);
