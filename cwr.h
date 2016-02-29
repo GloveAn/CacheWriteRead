@@ -42,9 +42,9 @@
 #define CELL_MANAGE_THRESHOLD 0
 
 /* cell state for handling bio request */
-#define CELL_STATE_READY     1 << 0
-#define CELL_STATE_ACCESSING 1 << 1
-#define CELL_STATE_MIGRATING 1 << 2
+#define CELL_STATE_READY     0
+#define CELL_STATE_ACCESSING 1 << 0
+#define CELL_STATE_MIGRATING 1 << 1
 
 /* bio info minimal available amount */
 #define MIN_BIO_INFO_AMOUNT 256

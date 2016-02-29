@@ -118,11 +118,7 @@ exit_swap:
     spin_lock(&cc->lock);
 
     csi->ccm1->state &= !CELL_STATE_MIGRATING;
-    if(!(csi->ccm1->state & CELL_STATE_ACCESSING))
-        csi->ccm1->state = CELL_STATE_READY;
     csi->ccm2->state &= !CELL_STATE_MIGRATING;
-    if(!(csi->ccm2->state & CELL_STATE_ACCESSING))
-        csi->ccm2->state = CELL_STATE_READY;
 
     spin_unlock(&cc->lock);
 
@@ -146,9 +142,7 @@ static inline void enqueue_pair(struct cwr_cell_meta *ccm1,
         return;
     }
 
-    ccm1->state &= !CELL_STATE_READY;
     ccm1->state |= CELL_STATE_MIGRATING;
-    ccm2->state &= !CELL_STATE_READY;
     ccm2->state |= CELL_STATE_MIGRATING;
 
     spin_unlock(&cc->lock);
@@ -395,13 +389,8 @@ static void cwr_end_io(struct bio *bio, int error)
     spin_lock(&cc->lock);
     cc->cell_meta[cell_id].bio_count--;
     if(cc->cell_meta[cell_id].bio_count == 0)
-    {
         // remove state accessing
         cc->cell_meta[cell_id].state &= !CELL_STATE_ACCESSING;
-        // the cell finshed all operations
-        if(!(cc->cell_meta[cell_id].state & CELL_STATE_MIGRATING))
-            cc->cell_meta[cell_id].state = CELL_STATE_READY;
-    }
     spin_unlock(&cc->lock);
 
     bio_endio(origin_bio, error);
@@ -428,6 +417,7 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     cell_id = get_cell_id(dt, cc, bio);
 
     /* update z value */
+    // TODO: seek distance is phisical distance
     seek_distance = cc->last_cell - cell_id;
     // make seek_distance an absolute value
     if(seek_distance < 0) seek_distance = -seek_distance;
@@ -468,7 +458,6 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     cc->last_cell = cell_id;
 
     /* remove ready state, add accessing state */
-    cc->cell_meta[cell_id].state &= !CELL_STATE_READY;
     cc->cell_meta[cell_id].state |= CELL_STATE_ACCESSING;
 
     // when bio count reaches 0, we will change cwr state to ready.
@@ -582,7 +571,7 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
     {
         cc->cell_meta[i].dev = cc->write_dev;
         cc->cell_meta[i].offset = j * cell_size;
-        cc->cell_meta[i].state = CELL_STATE_READY;
+
         INIT_LIST_HEAD(&cc->cell_meta[i].rw_list);
         INIT_LIST_HEAD(&cc->cell_meta[i].class_list);
         bio_list_init(&cc->cell_meta[i].bio_list);
@@ -594,7 +583,7 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
     {
         cc->cell_meta[i].dev = cc->read_dev;
         cc->cell_meta[i].offset = j * cell_size;
-        cc->cell_meta[i].state = CELL_STATE_READY;
+
         INIT_LIST_HEAD(&cc->cell_meta[i].rw_list);
         INIT_LIST_HEAD(&cc->cell_meta[i].class_list);
         bio_list_init(&cc->cell_meta[i].bio_list);
@@ -606,7 +595,7 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
     {
         cc->cell_meta[i].dev = cc->cold_dev;
         cc->cell_meta[i].offset = j * cell_size;
-        cc->cell_meta[i].state = CELL_STATE_READY;
+
         INIT_LIST_HEAD(&cc->cell_meta[i].rw_list);
         INIT_LIST_HEAD(&cc->cell_meta[i].class_list);
         bio_list_init(&cc->cell_meta[i].bio_list);
