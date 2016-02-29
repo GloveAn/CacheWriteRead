@@ -111,11 +111,13 @@ static void swap_worker(struct work_struct *ws)
     csi->ccm1->offset = csi->ccm2->offset;
     csi->ccm2->offset = tmp_offset;
 
+    printk_once(KERN_DEBUG "cwr: swap worker success.");
+
 exit_swap:
+    spin_lock(&cc->lock);
+
     finish_pending_bio(cc, csi->ccm1);
     finish_pending_bio(cc, csi->ccm2);
-
-    spin_lock(&cc->lock);
 
     csi->ccm1->state &= !CELL_STATE_MIGRATING;
     csi->ccm2->state &= !CELL_STATE_MIGRATING;
@@ -277,6 +279,8 @@ static void cell_manager(unsigned long data)
     if(cc->io_count >= IO_COUNT_THRESHOLD &&
        io_frenquency <= CELL_MANAGE_THRESHOLD)
     {
+        printk_once(KERN_DEBUG "cwr: cell manager is activated.");
+
         /* clear read count / write count, and z value to prevent overflow */
         list_for_each(cur_node, &cc->read_list)
         {
@@ -609,9 +613,9 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
 
     dt->private = cc;
 
-    printk(KERN_DEBUG "a cwr device is constructed.");
-    printk(KERN_DEBUG "cell size: %llu", cc->cell_size);
-    printk(KERN_DEBUG "c: %s, w:%s, r:%s",
+    printk(KERN_DEBUG "cwr: a device is constructed.");
+    printk(KERN_DEBUG "    cell size: %llu", cc->cell_size);
+    printk(KERN_DEBUG "    c: %s, w:%s, r:%s",
            cc->cold_dev->name, cc->write_dev->name, cc->read_dev->name);
     return 0;
 
@@ -638,14 +642,14 @@ static void cwr_dtr(struct dm_target *dt)
     dm_put_device(dt, cc->read_dev);
     kfree(cc);
 
-    printk(KERN_DEBUG "a cwr device is destructed.");
-    printk(KERN_DEBUG "c: %s, w:%s, r:%s",
+    printk(KERN_DEBUG "cwr: a device is destructed.");
+    printk(KERN_DEBUG "    c: %s, w:%s, r:%s",
            cc->cold_dev->name, cc->write_dev->name, cc->read_dev->name);
 }
 
 static struct target_type cwr_target = {
 	.name    = "cwr",
-	.version = {0, 0, 0},
+	.version = {0, 9, 0},
 	.module  = THIS_MODULE,
 	.ctr     = cwr_ctr,
 	.dtr     = cwr_dtr,

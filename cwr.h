@@ -7,7 +7,6 @@
 #include <linux/list.h>
 #include <linux/log2.h>
 #include <linux/timer.h>
-#include <linux/sched.h>
 #include <linux/spinlock.h>
 #include <asm/atomic.h>
 
@@ -67,10 +66,11 @@ struct cwr_bio_info
 struct cwr_cell_meta
 {
     // array index implies cell id / logical sector
+    /* coarse grain counter, work without mutex */
     unsigned int z_value; // represent data hotness
-
     unsigned int read_count;
     unsigned int write_count;
+
     atomic_t bio_count; // for managing cwr state
 
     struct dm_dev *dev;
@@ -100,6 +100,7 @@ struct cwr_context
     struct list_head read_list; // store read oriented cells
     struct list_head write_list; // store write oriented cells
 
+    /* coarse grain counter, work without mutex */
     unsigned int io_count;
     unsigned int old_io_count; // for calculating io frequency
 
