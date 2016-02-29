@@ -60,7 +60,6 @@ static void swap_worker(struct work_struct *ws)
     struct dm_io_region dir1, dir2;
     struct dm_dev *tmp_dev;
     sector_t tmp_offset;
-    unsigned int tmp_int;
     unsigned long error_bits;
     int re;
 
@@ -104,18 +103,6 @@ static void swap_worker(struct work_struct *ws)
     }
 
     /* swap meta info */
-    tmp_int = csi->ccm1->z_value;
-    csi->ccm1->z_value = csi->ccm2->z_value;
-    csi->ccm2->z_value = tmp_int;
-
-    tmp_int = csi->ccm1->read_count;
-    csi->ccm1->read_count = csi->ccm2->read_count;
-    csi->ccm2->read_count = tmp_int;
-
-    tmp_int = csi->ccm1->write_count;
-    csi->ccm1->write_count = csi->ccm2->write_count;
-    csi->ccm2->write_count = tmp_int;
-
     tmp_dev = csi->ccm1->dev;
     csi->ccm1->dev = csi->ccm2->dev;
     csi->ccm2->dev = tmp_dev;
@@ -124,10 +111,21 @@ static void swap_worker(struct work_struct *ws)
     csi->ccm1->offset = csi->ccm2->offset;
     csi->ccm2->offset = tmp_offset;
 
+exit_swap:
     finish_pending_bio(cc, csi->ccm1);
     finish_pending_bio(cc, csi->ccm2);
 
-exit_swap:
+    spin_lock(&cc->lock);
+
+    csi->ccm1->state &= !CELL_STATE_MIGRATING;
+    if(!(csi->ccm1->state & CELL_STATE_ACCESSING))
+        csi->ccm1->state = CELL_STATE_READY;
+    csi->ccm2->state &= !CELL_STATE_MIGRATING;
+    if(!(csi->ccm2->state & CELL_STATE_ACCESSING))
+        csi->ccm2->state = CELL_STATE_READY;
+
+    spin_unlock(&cc->lock);
+
     if(mem1) vfree(mem1);
     if(mem2) vfree(mem2);
     kfree(csi);
@@ -138,6 +136,22 @@ static inline void enqueue_pair(struct cwr_cell_meta *ccm1,
                                 struct cwr_context *cc)
 {
     struct cwr_swap_info *csi;
+
+    spin_lock(&cc->lock);
+
+    if(ccm1->state & CELL_STATE_ACCESSING &&
+       ccm2->state & CELL_STATE_ACCESSING)
+    {
+        spin_unlock(&cc->lock);
+        return;
+    }
+
+    ccm1->state &= !CELL_STATE_READY;
+    ccm1->state |= CELL_STATE_MIGRATING;
+    ccm2->state &= !CELL_STATE_READY;
+    ccm2->state |= CELL_STATE_MIGRATING;
+
+    spin_unlock(&cc->lock);
 
     csi = kzalloc(sizeof(struct cwr_swap_info), GFP_ATOMIC);
     if(csi == 0) return;
@@ -166,7 +180,7 @@ static inline void enqueue_pairs(struct cwr_context *cc)
     INIT_LIST_HEAD(&rc_node);
     INIT_LIST_HEAD(&cr_node);
 
-    /* cell classify */
+    /* classify cells */
     i = 0;
     list_for_each(cur_node, &cc->read_list)
     {
@@ -260,6 +274,7 @@ static void cell_manager(unsigned long data)
     struct list_head *cur_node, *next_node;
     struct cwr_cell_meta *ccm;
     unsigned int io_frenquency;
+    unsigned int min_z_value = -1;
 
     io_frenquency = (cc->io_count - cc->old_io_count) / CELL_MANAGE_INTERVAL;
     cc->old_io_count = cc->io_count;
@@ -268,10 +283,13 @@ static void cell_manager(unsigned long data)
     if(cc->io_count >= IO_COUNT_THRESHOLD &&
        io_frenquency <= CELL_MANAGE_THRESHOLD)
     {
-        /* clear read count and write count to prevent overflow */
+        /* clear read count / write count, and z value to prevent overflow */
         list_for_each(cur_node, &cc->read_list)
         {
 	        ccm = list_entry(cur_node, struct cwr_cell_meta, rw_list);
+
+            if(min_z_value > ccm->z_value) min_z_value = ccm->z_value;
+
             if(ccm->read_count > ccm->write_count)
             {
                 ccm->read_count -= ccm->write_count;
@@ -286,6 +304,9 @@ static void cell_manager(unsigned long data)
         list_for_each(cur_node, &cc->write_list)
         {
 	        ccm = list_entry(cur_node, struct cwr_cell_meta, rw_list);
+
+            if(min_z_value > ccm->z_value) min_z_value = ccm->z_value;
+
             if(ccm->read_count > ccm->write_count)
             {
                 ccm->read_count -= ccm->write_count;
@@ -298,10 +319,17 @@ static void cell_manager(unsigned long data)
             }
 	    }
 
-        /* migrate list node by its read count and write count */
+        /* clear z value,
+         * migrate list node by its read count and write count
+         */
+        spin_lock(&cc->lock);
+
         list_for_each_safe(cur_node, next_node, &cc->read_list)
         {
             ccm = list_entry(cur_node, struct cwr_cell_meta, rw_list);
+
+            ccm->z_value -= min_z_value;
+
             if(ccm->write_count > RW_STATE_THRESHOLD)
             {
                 list_del_init(cur_node);
@@ -311,12 +339,17 @@ static void cell_manager(unsigned long data)
         list_for_each_safe(cur_node, next_node, &cc->write_list)
         {
             ccm = list_entry(cur_node, struct cwr_cell_meta, rw_list);
+
+            ccm->z_value -= min_z_value;
+
             if(ccm->read_count > RW_STATE_THRESHOLD)
             {
                 list_del_init(cur_node);
                 list_add(cur_node, &cc->read_list);
             }
         }
+
+        spin_unlock(&cc->lock);
 
         /* sort hot cells to the front of lists */
         list_sort(0, &cc->read_list, list_sort_cmp);
@@ -354,11 +387,12 @@ static inline sector_t get_cell_id(struct dm_target *dt,
 static void cwr_end_io(struct bio *bio, int error)
 {
     // @error is set by bio_endio()
-    struct cwr_bio_info *cbi = (struct cwr_bio_info*)bio->bi_private;
+    struct cwr_bio_info *cbi = (struct cwr_bio_info *)bio->bi_private;
     struct bio *origin_bio = cbi->bio;
     struct cwr_context *cc = cbi->cc;
     sector_t cell_id = get_cell_id(cbi->dt, cc, bio);
 
+    spin_lock(&cc->lock);
     cc->cell_meta[cell_id].bio_count--;
     if(cc->cell_meta[cell_id].bio_count == 0)
     {
@@ -368,6 +402,7 @@ static void cwr_end_io(struct bio *bio, int error)
         if(!(cc->cell_meta[cell_id].state & CELL_STATE_MIGRATING))
             cc->cell_meta[cell_id].state = CELL_STATE_READY;
     }
+    spin_unlock(&cc->lock);
 
     bio_endio(origin_bio, error);
     mempool_free(cbi, bio_info_pool);
@@ -375,15 +410,16 @@ static void cwr_end_io(struct bio *bio, int error)
 
 static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
 {
-    struct cwr_context *cc = (struct cwr_context*)dt->private;
+    struct cwr_context *cc = (struct cwr_context *)dt->private;
     sector_t cell_id, seek_distance;
     int read_flag, write_flag;
     unsigned int z_value;
     struct bio *cwr_bio;
     struct cwr_bio_info *cbi;
 
-    // no need to protect io_count against race condition,
-    // it could be imprecisely.
+    /* no need to protect io_count against race condition,
+     * it could be imprecisely.
+     */
     cc->io_count++;
 
     read_flag = bio_data_dir(bio) & READ;
@@ -409,11 +445,6 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
         do_div(seek_distance, T2);
         z_value = (T1 + seek_distance) << z_value;
     }
-    cc->cell_meta[cell_id].z_value += z_value;
-
-    /* update r/w count */
-    cc->cell_meta[cell_id].read_count += read_flag;
-    cc->cell_meta[cell_id].write_count += write_flag;
 
     /* clone bio to handle cell states */
     cwr_bio = bio_clone(bio, GFP_NOIO);
@@ -427,9 +458,20 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     cwr_bio->bi_end_io = cwr_end_io;
     cwr_bio->bi_private = cbi;
 
-    // when bio count reaches 0, we will change cwr state to ready.
+    spin_lock(&cc->lock);
+
+    cc->cell_meta[cell_id].z_value += z_value;
+    cc->cell_meta[cell_id].read_count += read_flag;
+    cc->cell_meta[cell_id].write_count += write_flag;
     cc->cell_meta[cell_id].bio_count++;
 
+    cc->last_cell = cell_id;
+
+    /* remove ready state, add accessing state */
+    cc->cell_meta[cell_id].state &= !CELL_STATE_READY;
+    cc->cell_meta[cell_id].state |= CELL_STATE_ACCESSING;
+
+    // when bio count reaches 0, we will change cwr state to ready.
     if(cc->cell_meta[cell_id].state & CELL_STATE_MIGRATING)
     {
         // pend bio when migrating
@@ -437,15 +479,13 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     }
     else
     {
-        /* remove state ready, add state accessing */
-        cc->cell_meta[cell_id].state &= !CELL_STATE_READY;
-        cc->cell_meta[cell_id].state |= CELL_STATE_ACCESSING;
-
         /* redirect bio */
         cwr_bio->bi_bdev = cc->cell_meta[cell_id].dev->bdev;
         cwr_bio->bi_sector = cc->cell_meta[cell_id].offset * cc->cell_size;
         generic_make_request(cwr_bio);
     }
+
+    spin_unlock(&cc->lock);
 
     return DM_MAPIO_SUBMITTED;
 }
@@ -583,6 +623,8 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
     cc->cell_manage_timer.expires = jiffies + CELL_MANAGE_INTERVAL * HZ;
     add_timer(&cc->cell_manage_timer);
 
+    spin_lock_init(&cc->lock);
+
     dt->private = cc;
 
     printk(KERN_DEBUG "a cwr device is constructed.");
@@ -603,7 +645,7 @@ io_client_fail:
 
 static void cwr_dtr(struct dm_target *dt)
 {
-    struct cwr_context *cc = (struct cwr_context*)dt->private;
+    struct cwr_context *cc = (struct cwr_context *)dt->private;
 
     flush_workqueue(swap_work_queue);
     del_timer_sync(&cc->cell_manage_timer);

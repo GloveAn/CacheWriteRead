@@ -8,6 +8,8 @@
 #include <linux/log2.h>
 #include <linux/timer.h>
 #include <linux/sched.h>
+#include <linux/spinlock.h>
+#include <asm/bitops.h>
 
 // NOTE: sector_t = u64 = unsigned long long
 
@@ -81,7 +83,6 @@ struct cwr_cell_meta
     struct bio_list bio_list; // list for waiting for migration
 };
 
-/// TODO: add mutex to proetect data
 struct cwr_context
 {
     sector_t cell_size; // unit in sector
@@ -106,6 +107,8 @@ struct cwr_context
     struct dm_io_client *io_client;
 
     struct timer_list cell_manage_timer; // for cell management
+
+    spinlock_t lock;
 };
 
 /* START // code snippet from linux 4.4.2: linked list sort functions, */
