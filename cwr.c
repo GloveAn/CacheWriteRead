@@ -476,31 +476,28 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     return DM_MAPIO_SUBMITTED;
 }
 
-/*
- * dmsetup create dev_name --table
- * '0 102400 cwr cell_size /dev/hdd /dev/write_cache /dev/read-cache'
- */
+// dmsetup create test --table '0 1048576 cwr 16 /dev/sdc1 /dev/sdc2 /dev/sdc3'
 static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
 {
     struct cwr_context *cc;
-    sector_t cell_size, cell_amount;
+    unsigned int cell_size, cell_amount;
     int re = 0;
     unsigned int i, j;
 
     if(argc != 4)
     {
-        dt->error = "cwr: invalid argument count";
+        dt->error = "invalid argument count";
         return -EINVAL;
     }
 
-    if(sscanf(argv[0], "%llu", &cell_size) != 1)
+    if(sscanf(argv[0], "%u", &cell_size) != 1)
     {
-        dt->error = "cwr: cell size read error";
+        dt->error = "cell size read error";
         return -EINVAL;
     }
     if(is_power_of_2(cell_size) == 0)
     {
-        dt->error = "cwr: cell size is not power of 2";
+        dt->error = "cell size is not power of 2";
         return -EINVAL;
     }
     cell_amount = dt->len >> ilog2(cell_size);
@@ -510,7 +507,7 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
                  GFP_KERNEL);
     if(cc == 0)
     {
-        dt->error = "cwr: cannot allocate cwr context";
+        dt->error = "cannot allocate cwr context";
         return -ENOMEM;
     }
 
@@ -518,9 +515,15 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
     if(IS_ERR(cc->io_client))
     {
         re = PTR_ERR(cc->io_client);
-        dt->error = "cwr: create dm io client fail.";
+        dt->error = "create dm io client fail.";
         goto io_client_fail;
     }
+
+    cc->cell_size = cell_size;
+
+    cc->write_dev_size = WRITE_CACHE_SIZE * cc->cell_size;
+    cc->read_dev_size = READ_CACHE_SIZE * cc->cell_size;
+    cc->cold_dev_size = dt->len - cc->write_dev_size - cc->read_dev_size;
 
     /* get mapped targets */
     re |= dm_get_device(dt, argv[1], 0, cc->cold_dev_size,
@@ -531,19 +534,13 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
                         dm_table_get_mode(dt->table), &cc->read_dev);
     if(re != 0) goto device_invalid;
 
-    cc->cell_size = cell_size;
-
-    cc->write_dev_size = WRITE_CACHE_SIZE * cc->cell_size;
-    cc->read_dev_size = READ_CACHE_SIZE * cc->cell_size;
-    cc->cold_dev_size = dt->len - cc->write_dev_size - cc->read_dev_size;
-
     // disk size check
     // i_size_read returns device size by bytes
     if((i_size_read(cc->cold_dev->bdev->bd_inode) < (cc->cold_dev_size << 9))
     || (i_size_read(cc->write_dev->bdev->bd_inode) < (cc->write_dev_size << 9))
     || (i_size_read(cc->read_dev->bdev->bd_inode) < (cc->read_dev_size << 9)))
     {
-        dt->error = "cwr: disk is too small";
+        dt->error = "disk is too small";
         re = -EINVAL;
         goto size_invalid;
     }
@@ -552,7 +549,7 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
     || (cc->write_dev_size & (cc->cell_size - 1))
     || (cc->read_dev_size & (cc->cell_size - 1)))
     {
-        dt->error = "cwr: disk size is not alignt";
+        dt->error = "disk size is not alignt";
         re = -EINVAL;
         goto size_invalid;
     }
