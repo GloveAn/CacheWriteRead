@@ -48,17 +48,10 @@
 /* bio info minimal available amount */
 #define MIN_BIO_INFO_AMOUNT 256
 
-struct cwr_swap_info
-{
-    struct cwr_cell_meta *ccm1;
-    struct cwr_cell_meta *ccm2;
-    struct cwr_context *cc;
-    struct list_head swap_list;
-};
-
 struct cwr_bio_info
 {
     struct bio *bio;
+    struct cwr_context *cc;
     struct cwr_cell_meta *ccm;
 };
 
@@ -70,7 +63,7 @@ struct cwr_cell_meta
     unsigned int read_count;
     unsigned int write_count;
 
-    atomic_t bio_count; // for managing cwr state
+    unsigned int bio_count; // for managing cwr state
 
     struct dm_dev *dev;
     sector_t offset; // physical location on device, unit in sector
@@ -104,7 +97,6 @@ struct cwr_context
     unsigned int io_count;
     unsigned int old_io_count; // for calculating io frequency
 
-    struct work_struct swap_work;
     struct dm_io_client *io_client;
 
     struct timer_list cell_manage_timer; // for cell management

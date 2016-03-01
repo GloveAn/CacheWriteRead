@@ -3,9 +3,6 @@
 static struct kmem_cache *bio_info_cache;
 static mempool_t *bio_info_pool;
 
-LIST_HEAD(swap_list);
-struct workqueue_struct *swap_work_queue;
-
 static inline void finish_pending_bio(struct cwr_context *cc,
                                       struct cwr_cell_meta *ccm)
 {
@@ -15,7 +12,7 @@ static inline void finish_pending_bio(struct cwr_context *cc,
     {
         bio = bio_list_pop(&ccm->bio_list);
         bio->bi_next = 0; // single bio instead of a bio list
-        bio->bi_sector = ccm->offset + bio->bi_sector & cc->cell_mask;
+        bio->bi_sector = ccm->offset + (bio->bi_sector & cc->cell_mask);
         bio->bi_bdev = ccm->dev->bdev;
 
         generic_make_request(bio);
@@ -52,35 +49,41 @@ static inline struct dm_io_region make_io_region(struct cwr_context *cc,
     return where;
 }
 
-static void swap_worker(struct work_struct *ws)
+static inline void swap_worker(struct cwr_cell_meta *ccm1,
+                               struct cwr_cell_meta *ccm2,
+                               void *mem1,
+                               void *mem2,
+                               struct cwr_context *cc)
 {
-    struct cwr_context *cc;
-    struct cwr_swap_info *csi;
-    void *mem1, *mem2;
     struct dm_io_region dir1, dir2;
     struct dm_dev *tmp_dev;
     sector_t tmp_offset;
     unsigned long error_bits;
     int re;
 
-    cc = container_of(ws, struct cwr_context, swap_work);
-    csi = list_first_entry(&swap_list, struct cwr_swap_info, swap_list);
+    spin_lock(&cc->lock);
 
-    list_del(&csi->swap_list);
+    if(ccm1->state & CELL_STATE_ACCESSING &&
+       ccm2->state & CELL_STATE_ACCESSING)
+    {
+        spin_unlock(&cc->lock);
+        return;
+    }
 
-    mem1 = vmalloc(cc->cell_size << 9);
-    mem2 = vmalloc(cc->cell_size << 9);
-    if(mem1 == 0 || mem2 == 0) goto exit_swap;
+    ccm1->state |= CELL_STATE_MIGRATING;
+    ccm2->state |= CELL_STATE_MIGRATING;
+
+    spin_unlock(&cc->lock);
 
     /* read cell data to memory */
-    dir1 = make_io_region(cc, csi->ccm1);
+    dir1 = make_io_region(cc, ccm1);
     re = dm_io_sync_vm(1, &dir1, READ, mem1, &error_bits, cc);
     if(re < 0)
     {
         printk(KERN_ERR "cwr: read cells fail.");
         goto exit_swap;
     }
-    dir2 = make_io_region(cc, csi->ccm2);
+    dir2 = make_io_region(cc, ccm2);
     re = dm_io_sync_vm(1, &dir2, READ, mem2, &error_bits, cc);
     if(re < 0)
     {
@@ -103,71 +106,45 @@ static void swap_worker(struct work_struct *ws)
     }
 
     /* swap meta info */
-    tmp_dev = csi->ccm1->dev;
-    csi->ccm1->dev = csi->ccm2->dev;
-    csi->ccm2->dev = tmp_dev;
+    tmp_dev = ccm1->dev;
+    ccm1->dev = ccm2->dev;
+    ccm2->dev = tmp_dev;
 
-    tmp_offset = csi->ccm1->offset;
-    csi->ccm1->offset = csi->ccm2->offset;
-    csi->ccm2->offset = tmp_offset;
+    tmp_offset = ccm1->offset;
+    ccm1->offset = ccm2->offset;
+    ccm2->offset = tmp_offset;
 
-    printk_once(KERN_DEBUG "cwr: swap worker success.");
+    printk(KERN_DEBUG "cwr: swap worker runs well.");
+    printk(KERN_DEBUG "    swapped pair ccm1:%d, ccm2:%d.",
+           ccm1 - cc->cell_meta, ccm2 - cc->cell_meta);
 
 exit_swap:
     spin_lock(&cc->lock);
 
-    finish_pending_bio(cc, csi->ccm1);
-    finish_pending_bio(cc, csi->ccm2);
+    finish_pending_bio(cc, ccm1);
+    finish_pending_bio(cc, ccm2);
 
-    csi->ccm1->state &= !CELL_STATE_MIGRATING;
-    csi->ccm2->state &= !CELL_STATE_MIGRATING;
-
-    spin_unlock(&cc->lock);
-
-    if(mem1) vfree(mem1);
-    if(mem2) vfree(mem2);
-    kfree(csi);
-}
-
-static inline void enqueue_pair(struct cwr_cell_meta *ccm1,
-                                struct cwr_cell_meta *ccm2,
-                                struct cwr_context *cc)
-{
-    struct cwr_swap_info *csi;
-
-    spin_lock(&cc->lock);
-
-    if(ccm1->state & CELL_STATE_ACCESSING &&
-       ccm2->state & CELL_STATE_ACCESSING)
-    {
-        spin_unlock(&cc->lock);
-        return;
-    }
-
-    ccm1->state |= CELL_STATE_MIGRATING;
-    ccm2->state |= CELL_STATE_MIGRATING;
+    ccm1->state &= !CELL_STATE_MIGRATING;
+    ccm2->state &= !CELL_STATE_MIGRATING;
 
     spin_unlock(&cc->lock);
-
-    csi = kzalloc(sizeof(struct cwr_swap_info), GFP_ATOMIC);
-    if(csi == 0) return;
-
-    csi->ccm1 = ccm1;
-    csi->ccm2 = ccm2;
-    csi->cc = cc;
-    INIT_LIST_HEAD(&csi->swap_list);
-
-    // swap info will be used by worker of work queue
-    list_add_tail(&csi->swap_list, &swap_list);
-    queue_work(swap_work_queue, &cc->swap_work);
 }
 
-static inline void enqueue_pairs(struct cwr_context *cc)
+static inline void enqueue_swap(struct cwr_context *cc)
 {
     struct list_head wc_node, cw_node, wr_node, rw_node, rc_node, cr_node;
     struct list_head *cur_node, *next_node, *swap_node1, *swap_node2;
     struct cwr_cell_meta *ccm;
     unsigned int i;
+    void *mem1, *mem2;
+
+    mem1 = vmalloc(cc->cell_size << 9);
+    mem2 = vmalloc(cc->cell_size << 9);
+    if(mem1 == 0 || mem2 == 0)
+    {
+        printk(KERN_ERR "cwr: allocate virtual memory for swaping fail.");
+        goto free_memory;
+    }
 
     INIT_LIST_HEAD(&wc_node);
     INIT_LIST_HEAD(&cw_node);
@@ -222,21 +199,21 @@ static inline void enqueue_pairs(struct cwr_context *cc)
     for(swap_node1 = wc_node.next, swap_node2 = cw_node.next;
         swap_node1->next != &wc_node && swap_node2 != &cw_node;
         swap_node1 = swap_node1->next, swap_node2 = swap_node2->next)
-        enqueue_pair(list_entry(swap_node1, struct cwr_cell_meta, class_list),
-                     list_entry(swap_node2, struct cwr_cell_meta, class_list),
-                     cc);
+        swap_worker(list_entry(swap_node1, struct cwr_cell_meta, class_list),
+                    list_entry(swap_node2, struct cwr_cell_meta, class_list),
+                    mem1, mem2, cc);
     for(swap_node1 = rc_node.next, swap_node2 = cr_node.next;
         swap_node1->next != &rc_node && swap_node2 != &cr_node;
         swap_node1 = swap_node1->next, swap_node2 = swap_node2->next)
-        enqueue_pair(list_entry(swap_node1, struct cwr_cell_meta, class_list),
-                     list_entry(swap_node2, struct cwr_cell_meta, class_list),
-                     cc);
+        swap_worker(list_entry(swap_node1, struct cwr_cell_meta, class_list),
+                    list_entry(swap_node2, struct cwr_cell_meta, class_list),
+                    mem1, mem2, cc);
     for(swap_node1 = wr_node.next, swap_node2 = rw_node.next;
         swap_node1->next != &wr_node && swap_node2 != &rw_node;
         swap_node1 = swap_node1->next, swap_node2 = swap_node2->next)
-        enqueue_pair(list_entry(swap_node1, struct cwr_cell_meta, class_list),
-                     list_entry(swap_node2, struct cwr_cell_meta, class_list),
-                     cc);
+        swap_worker(list_entry(swap_node1, struct cwr_cell_meta, class_list),
+                    list_entry(swap_node2, struct cwr_cell_meta, class_list),
+                    mem1, mem2, cc);
 
     list_for_each_safe(cur_node, next_node, &wc_node) list_del_init(cur_node);
     list_for_each_safe(cur_node, next_node, &cw_node) list_del_init(cur_node);
@@ -244,6 +221,10 @@ static inline void enqueue_pairs(struct cwr_context *cc)
     list_for_each_safe(cur_node, next_node, &cr_node) list_del_init(cur_node);
     list_for_each_safe(cur_node, next_node, &rw_node) list_del_init(cur_node);
     list_for_each_safe(cur_node, next_node, &wr_node) list_del_init(cur_node);
+
+free_memory:
+    if(mem1) vfree(mem1);
+    if(mem2) vfree(mem2);
 }
 
 static int list_sort_cmp(void *priv, struct list_head* a, struct list_head* b)
@@ -272,18 +253,19 @@ static void cell_manager(unsigned long data)
     int io_frenquency;
     int min_z_value = INT_MAX;
 
-    io_frenquency = cc->io_count - cc->old_io_count / CELL_MANAGE_INTERVAL;
+    io_frenquency = (cc->io_count - cc->old_io_count) / CELL_MANAGE_INTERVAL;
     cc->old_io_count = cc->io_count;
 
-    printk_once(KERN_DEBUG "cwr: cell manager trigerred");
-    printk_once(KERN_DEBUG "    io freq:%d, io count:%d",
-                io_frenquency, cc->old_io_count);
-
+    //* DEBUG
+    printk(KERN_DEBUG "cwr: cell manager triggered");
+    printk(KERN_DEBUG "    io freq:%d, io count:%d",
+           io_frenquency, cc->old_io_count); // DEBUG */
+return;
     // trigger under certain conditions
     if(cc->io_count >= IO_COUNT_THRESHOLD &&
        io_frenquency <= CELL_MANAGE_THRESHOLD)
     {
-        printk_once(KERN_DEBUG "cwr: cell manager is activated.");
+        //printk_once(KERN_DEBUG "cwr: cell manager is activated."); // DEBUG
 
         /* clear read count / write count, and z value to prevent overflow */
         list_for_each(cur_node, &cc->read_list)
@@ -365,7 +347,7 @@ static void cell_manager(unsigned long data)
          *   1. it's in accessing
          *   2. we can't find a pair for it
          */
-        enqueue_pairs(cc);
+        enqueue_swap(cc);
 
         // reset io count after migration
         cc->io_count = 0;
@@ -389,10 +371,17 @@ static void cwr_end_io(struct bio *bio, int error)
     // @error is set by bio_endio()
     struct cwr_bio_info *cbi = (struct cwr_bio_info *)bio->bi_private;
     struct bio *origin_bio = cbi->bio;
+    struct cwr_context *cc = cbi->cc;
     struct cwr_cell_meta *ccm = cbi->ccm;
 
-    if(atomic_dec_and_test(&ccm->bio_count))
+    spin_lock(&cc->lock);
+    ccm->bio_count--;
+    if(ccm->bio_count == 0)
+    {
+        //printk(KERN_DEBUG "cwr: ccm %p remove state accessing", ccm); // DEBUG
         ccm->state &= !CELL_STATE_ACCESSING;
+    }
+    spin_unlock(&cc->lock);
 
     bio_endio(origin_bio, error);
     mempool_free(cbi, bio_info_pool);
@@ -444,6 +433,7 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     cbi = (struct cwr_bio_info *)mempool_alloc(bio_info_pool, GFP_NOIO);
 
     cbi->bio = bio;
+    cbi->cc = cc;
     cbi->ccm = cc->cell_meta + cell_id;
 
     cwr_bio->bi_end_io = cwr_end_io;
@@ -451,13 +441,13 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
 
     cc->cell_meta[cell_id].read_count += read_flag;
     cc->cell_meta[cell_id].write_count += write_flag;
-    // when bio count reaches 0, we will change cwr state to ready.
-    atomic_inc(&cc->cell_meta[cell_id].bio_count);
 
     spin_lock(&cc->lock);
 
     cc->last_cell = cell_id;
 
+    // when bio count reaches 0, we will change cwr state to ready.
+    cc->cell_meta[cell_id].bio_count++;
     cc->cell_meta[cell_id].state |= CELL_STATE_ACCESSING;
 
     if(cc->cell_meta[cell_id].state & CELL_STATE_MIGRATING)
@@ -602,13 +592,11 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
         list_add(&cc->cell_meta[i].rw_list, &cc->write_list);
     }
 
-    INIT_WORK(&cc->swap_work, swap_worker);
-
     init_timer(&cc->cell_manage_timer);
     cc->cell_manage_timer.data = (unsigned long)cc;
     cc->cell_manage_timer.function = cell_manager;
     cc->cell_manage_timer.expires = jiffies + CELL_MANAGE_INTERVAL * HZ;
-    //add_timer(&cc->cell_manage_timer);
+    add_timer(&cc->cell_manage_timer);
 
     spin_lock_init(&cc->lock);
 
@@ -634,7 +622,6 @@ static void cwr_dtr(struct dm_target *dt)
 {
     struct cwr_context *cc = (struct cwr_context *)dt->private;
 
-    flush_workqueue(swap_work_queue);
     del_timer_sync(&cc->cell_manage_timer);
     dm_io_client_destroy(cc->io_client);
 
@@ -676,14 +663,6 @@ static int __init cwr_init(void)
                                    mempool_alloc_slab, mempool_free_slab,
                                    bio_info_cache);
 
-    swap_work_queue = create_workqueue("CWR_WORK_QUEUE");
-    if(swap_work_queue == 0)
-    {
-        printk(KERN_ERR "create work queue fail.");
-        re = -ENOMEM;
-        goto work_queue_fail;
-    }
-
     re = dm_register_target(&cwr_target);
     if(re < 0)
     {
@@ -695,8 +674,6 @@ static int __init cwr_init(void)
     return 0;
 
 register_target_fail:
-    destroy_workqueue(swap_work_queue);
-work_queue_fail:
     mempool_destroy(bio_info_pool);
     kmem_cache_destroy(bio_info_cache);
 
@@ -706,7 +683,6 @@ work_queue_fail:
 static void __exit cwr_done(void)
 {
     dm_unregister_target(&cwr_target);
-    destroy_workqueue(swap_work_queue);
     mempool_destroy(bio_info_pool);
     kmem_cache_destroy(bio_info_cache);
     printk(KERN_DEBUG "cwr exited.");
