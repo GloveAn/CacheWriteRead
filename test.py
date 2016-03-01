@@ -32,36 +32,38 @@ def main():
     print("every thing is ok.")
 
 def write_test(fd, length):
-    sector = [i % 256 for i in range(512)]
+    blob = ''
+    for i in range(512 * 2):
+        blob += chr(i % 256)
 
     os.lseek(fd, os.SEEK_SET, 0)
     for i in range(length):
-        blob = ''
-        for j in range(512):
-            blob += chr(sector[(j + i) % 512])
+        x = i % 256
 
-        if not(i % 32):
+        if not x:
             print("\rwrite progress %6.2f%%" % (i * 100.0 / length), end="")
 
-        if os.write(fd, blob) != 512:
-            print("\nwrite error.")
+        if os.write(fd, blob[x : x + 512]) != 512:
+            print("")
+            print("write error.")
             quit()
+
     print("\rwrite progress %6.2f" % 100.0)
 
 def read_test(fd, length):
-    sector = [i % 256 for i in range(512)]
+    blob = ''
+    for i in range(512 * 2):
+        blob += chr(i % 256)
 
     os.lseek(fd, os.SEEK_SET, 0)
     for i in range(length):
-        blob = ''
-        for j in range(512):
-            blob += chr(sector[(j + i) % 512])
+        x = i % 256
 
-        if not(i % 32):
+        if not x:
             print("\rread progress  %6.2f%%" % (i * 100.0 / length), end="")
 
         data = os.read(fd, 512)
-        if data != blob:
+        if data != blob[x : x + 512]:
             print("")
             if len(data) < 512:
                 print("read error.")
@@ -73,6 +75,7 @@ def read_test(fd, length):
             print("blob in hex")
             print(":".join("%02X" % ord(c) for c in blob))
             quit()
+
     print("\rread progress  %6.2f" % 100.0)
 
 if __name__ == '__main__':
