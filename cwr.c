@@ -15,7 +15,7 @@ static inline void finish_pending_bio(struct cwr_context *cc,
     {
         bio = bio_list_pop(&ccm->bio_list);
         bio->bi_next = 0; // single bio instead of a bio list
-        bio->bi_sector = ccm->offset * cc->cell_size;
+        bio->bi_sector = ccm->offset + bio->bi_sector & cc->cell_mask;
         bio->bi_bdev = ccm->dev->bdev;
 
         generic_make_request(bio);
@@ -275,6 +275,10 @@ static void cell_manager(unsigned long data)
     io_frenquency = cc->io_count - cc->old_io_count / CELL_MANAGE_INTERVAL;
     cc->old_io_count = cc->io_count;
 
+    printk_once(KERN_DEBUG "cwr: cell manager trigerred");
+    printk_once(KERN_DEBUG "    io freq:%d, io count:%d",
+                io_frenquency, cc->old_io_count);
+
     // trigger under certain conditions
     if(cc->io_count >= IO_COUNT_THRESHOLD &&
        io_frenquency <= CELL_MANAGE_THRESHOLD)
@@ -377,7 +381,7 @@ static inline sector_t get_cell_id(struct dm_target *dt,
                                    struct cwr_context *cc,
                                    struct bio *bio)
 {
-    return (bio->bi_sector - dt->begin) >> (cc->cell_size - 1);
+    return (bio->bi_sector - dt->begin) >> ilog2(cc->cell_size);
 }
 
 static void cwr_end_io(struct bio *bio, int error)
@@ -385,11 +389,10 @@ static void cwr_end_io(struct bio *bio, int error)
     // @error is set by bio_endio()
     struct cwr_bio_info *cbi = (struct cwr_bio_info *)bio->bi_private;
     struct bio *origin_bio = cbi->bio;
-    struct cwr_context *cc = cbi->cc;
-    sector_t cell_id = get_cell_id(cbi->dt, cc, bio);
+    struct cwr_cell_meta *ccm = cbi->ccm;
 
-    if(atomic_dec_and_test(&cc->cell_meta[cell_id].bio_count))
-        cc->cell_meta[cell_id].state &= !CELL_STATE_ACCESSING;
+    if(atomic_dec_and_test(&ccm->bio_count))
+        ccm->state &= !CELL_STATE_ACCESSING;
 
     bio_endio(origin_bio, error);
     mempool_free(cbi, bio_info_pool);
@@ -413,9 +416,9 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     write_flag = bio_data_dir(bio) & WRITE;
 
     cell_id = get_cell_id(dt, cc, bio);
+    //printk(KERN_DEBUG "cwr: map cell id: %llu", cell_id); // DEBUG
 
     /* update z value */
-    // TODO: seek distance is phisical distance
     seek_distance = cc->last_cell - cell_id;
     // make seek_distance an absolute value
     if(seek_distance < 0) seek_distance = -seek_distance;
@@ -441,8 +444,7 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     cbi = (struct cwr_bio_info *)mempool_alloc(bio_info_pool, GFP_NOIO);
 
     cbi->bio = bio;
-    cbi->dt = dt;
-    cbi->cc = cc;
+    cbi->ccm = cc->cell_meta + cell_id;
 
     cwr_bio->bi_end_io = cwr_end_io;
     cwr_bio->bi_private = cbi;
@@ -467,7 +469,8 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     {
         /* redirect bio */
         cwr_bio->bi_bdev = cc->cell_meta[cell_id].dev->bdev;
-        cwr_bio->bi_sector = cc->cell_meta[cell_id].offset * cc->cell_size;
+        cwr_bio->bi_sector = cc->cell_meta[cell_id].offset +
+                             (cwr_bio->bi_sector & cc->cell_mask);
         generic_make_request(cwr_bio);
     }
 
@@ -520,6 +523,7 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
     }
 
     cc->cell_size = cell_size;
+    cc->cell_mask = cell_size - 1;
 
     cc->write_dev_size = WRITE_CACHE_SIZE * cc->cell_size;
     cc->read_dev_size = READ_CACHE_SIZE * cc->cell_size;
@@ -604,7 +608,7 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
     cc->cell_manage_timer.data = (unsigned long)cc;
     cc->cell_manage_timer.function = cell_manager;
     cc->cell_manage_timer.expires = jiffies + CELL_MANAGE_INTERVAL * HZ;
-    add_timer(&cc->cell_manage_timer);
+    //add_timer(&cc->cell_manage_timer);
 
     spin_lock_init(&cc->lock);
 

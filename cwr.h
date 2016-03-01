@@ -59,8 +59,7 @@ struct cwr_swap_info
 struct cwr_bio_info
 {
     struct bio *bio;
-    struct dm_target *dt;
-    struct cwr_context *cc;
+    struct cwr_cell_meta *ccm;
 };
 
 struct cwr_cell_meta
@@ -87,6 +86,7 @@ struct cwr_context
 {
     sector_t cell_size; // unit in sector
     sector_t last_cell; // unit in sector, for calculating z value
+    sector_t cell_mask; // cell_mask = cell_size - 1
 
     struct dm_dev *cold_dev;
     struct dm_dev *read_dev;
