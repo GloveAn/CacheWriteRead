@@ -50,7 +50,11 @@
 
 struct cwr_bio_info
 {
-    struct bio *bio;
+    sector_t sector;
+    struct block_device *bdev;
+    bio_end_io_t *end_io;
+    void *private;
+
     struct cwr_context *cc;
     struct cwr_cell_meta *ccm;
 };
@@ -64,11 +68,10 @@ struct cwr_cell_meta
     unsigned int write_count;
 
     unsigned int bio_count; // for managing cwr state
+    unsigned int state;
 
     struct dm_dev *dev;
     sector_t offset; // physical location on device, unit in sector
-
-    unsigned int state;
 
     struct list_head rw_list; // list for sorting by data hotness / z value
     struct list_head class_list; // list for migration
