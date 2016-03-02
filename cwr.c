@@ -388,14 +388,20 @@ static void cwr_end_io(struct bio *bio, int error)
 {
     // @error is set by bio_endio()
     struct cwr_bio_info *cbi = (struct cwr_bio_info *)bio->bi_private;
+    unsigned long flag;
 
     bio->bi_sector = cbi->sector;
     bio->bi_bdev = cbi->bdev;
     bio->bi_end_io = cbi->end_io;
     bio->bi_private = cbi->private;
 
-    if(atomic_dec_and_test(&cbi->ccm->bio_count))
+    spin_lock_irqsave(&cbi->cc->lock, flag);
+
+    cbi->ccm->bio_count--;
+    if(cbi->ccm->bio_count == 0)
         cbi->ccm->state &= !CELL_STATE_ACCESSING;
+
+    spin_unlock_irqrestore(&cbi->cc->lock, flag);
 
     bio_endio(bio, error);
     mempool_free(cbi, bio_info_pool);
@@ -409,10 +415,10 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     int z_value;
     //struct bio *cwr_bio;
     struct cwr_bio_info *cbi;
+    unsigned long flag;
 
     cell_id = get_cell_id(dt, cc, bio);
 
-#if 0
     /* no need to protect io_count against race condition,
      * it could be imprecisely.
      */
@@ -442,7 +448,6 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
         z_value = (T1 + seek_distance) << z_value;
     }
     cc->cell_meta[cell_id].z_value += z_value;
-#endif
 
     cbi = (struct cwr_bio_info *)mempool_alloc(bio_info_pool, GFP_NOIO);
 
@@ -450,37 +455,38 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     cbi->bdev = bio->bi_bdev;
     cbi->end_io = bio->bi_end_io;
     cbi->private = bio->bi_private;
+    cbi->cc = cc;
     cbi->ccm = cc->cell_meta + cell_id;
 
     bio->bi_end_io = cwr_end_io;
     bio->bi_private = cbi;
 
-    //cc->cell_meta[cell_id].read_count += read_flag;
-    //cc->cell_meta[cell_id].write_count += write_flag;
+    cc->cell_meta[cell_id].read_count += read_flag;
+    cc->cell_meta[cell_id].write_count += write_flag;
     // when bio count reaches 0, we will change cwr state to ready.
-    atomic_inc(&cc->cell_meta[cell_id].bio_count);
 
-    spin_lock(&cc->lock);
+    spin_lock_irqsave(&cc->lock, flag);
 
-    //cc->last_cell = cell_id;
+    cc->last_cell = cell_id;
 
+    cc->cell_meta[cell_id].bio_count++;
     cc->cell_meta[cell_id].state |= CELL_STATE_ACCESSING;
 
     //if(cc->cell_meta[cell_id].state & CELL_STATE_MIGRATING)
     //{
         // pend bio when migrating
         //bio_list_add(&cc->cell_meta[cell_id].bio_list, cwr_bio);
+        //spin_unlock(&cc->lock);
     //}
     //else
     //{
+        spin_unlock_irqrestore(&cc->lock, flag);
         /* redirect bio */
         bio->bi_bdev = cc->cell_meta[cell_id].dev->bdev;
         bio->bi_sector = cc->cell_meta[cell_id].offset +
                          (bio->bi_sector & cc->cell_mask);
         generic_make_request(bio);
     //}
-
-    spin_unlock(&cc->lock);
 
     return DM_MAPIO_SUBMITTED;
 }
