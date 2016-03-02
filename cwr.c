@@ -15,7 +15,7 @@ static inline void finish_pending_bio(struct cwr_context *cc,
     {
         bio = bio_list_pop(&ccm->bio_list);
         bio->bi_next = 0; // single bio instead of a bio list
-        bio->bi_sector = ccm->offset + bio->bi_sector & cc->cell_mask;
+        bio->bi_sector = ccm->offset + (bio->bi_sector & cc->cell_mask);
         bio->bi_bdev = ccm->dev->bdev;
 
         generic_make_request(bio);
@@ -388,13 +388,16 @@ static void cwr_end_io(struct bio *bio, int error)
 {
     // @error is set by bio_endio()
     struct cwr_bio_info *cbi = (struct cwr_bio_info *)bio->bi_private;
-    struct bio *origin_bio = cbi->bio;
-    struct cwr_cell_meta *ccm = cbi->ccm;
 
-    if(atomic_dec_and_test(&ccm->bio_count))
-        ccm->state &= !CELL_STATE_ACCESSING;
+    bio->bi_sector = cbi->sector;
+    bio->bi_bdev = cbi->bdev;
+    bio->bi_end_io = cbi->end_io;
+    bio->bi_private = cbi->private;
 
-    bio_endio(origin_bio, error);
+    if(atomic_dec_and_test(&cbi->ccm->bio_count))
+        cbi->ccm->state &= !CELL_STATE_ACCESSING;
+
+    bio_endio(bio, error);
     mempool_free(cbi, bio_info_pool);
 }
 
@@ -404,9 +407,12 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     sector_t cell_id, seek_distance;
     int read_flag, write_flag;
     int z_value;
-    struct bio *cwr_bio;
+    //struct bio *cwr_bio;
     struct cwr_bio_info *cbi;
 
+    cell_id = get_cell_id(dt, cc, bio);
+
+#if 0
     /* no need to protect io_count against race condition,
      * it could be imprecisely.
      */
@@ -415,7 +421,6 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     read_flag = bio_data_dir(bio) & READ;
     write_flag = bio_data_dir(bio) & WRITE;
 
-    cell_id = get_cell_id(dt, cc, bio);
     //printk(KERN_DEBUG "cwr: map cell id: %llu", cell_id); // DEBUG
 
     /* update z value */
@@ -437,42 +442,43 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
         z_value = (T1 + seek_distance) << z_value;
     }
     cc->cell_meta[cell_id].z_value += z_value;
+#endif
 
-    /* clone bio to handle cell states */
-    cwr_bio = bio_clone(bio, GFP_NOIO);
-    if(cwr_bio == 0) return DM_MAPIO_REQUEUE; // try again later
     cbi = (struct cwr_bio_info *)mempool_alloc(bio_info_pool, GFP_NOIO);
 
-    cbi->bio = bio;
+    cbi->sector = bio->bi_sector;
+    cbi->bdev = bio->bi_bdev;
+    cbi->end_io = bio->bi_end_io;
+    cbi->private = bio->bi_private;
     cbi->ccm = cc->cell_meta + cell_id;
 
-    cwr_bio->bi_end_io = cwr_end_io;
-    cwr_bio->bi_private = cbi;
+    bio->bi_end_io = cwr_end_io;
+    bio->bi_private = cbi;
 
-    cc->cell_meta[cell_id].read_count += read_flag;
-    cc->cell_meta[cell_id].write_count += write_flag;
+    //cc->cell_meta[cell_id].read_count += read_flag;
+    //cc->cell_meta[cell_id].write_count += write_flag;
     // when bio count reaches 0, we will change cwr state to ready.
     atomic_inc(&cc->cell_meta[cell_id].bio_count);
 
     spin_lock(&cc->lock);
 
-    cc->last_cell = cell_id;
+    //cc->last_cell = cell_id;
 
     cc->cell_meta[cell_id].state |= CELL_STATE_ACCESSING;
 
-    if(cc->cell_meta[cell_id].state & CELL_STATE_MIGRATING)
-    {
+    //if(cc->cell_meta[cell_id].state & CELL_STATE_MIGRATING)
+    //{
         // pend bio when migrating
-        bio_list_add(&cc->cell_meta[cell_id].bio_list, cwr_bio);
-    }
-    else
-    {
+        //bio_list_add(&cc->cell_meta[cell_id].bio_list, cwr_bio);
+    //}
+    //else
+    //{
         /* redirect bio */
-        cwr_bio->bi_bdev = cc->cell_meta[cell_id].dev->bdev;
-        cwr_bio->bi_sector = cc->cell_meta[cell_id].offset +
-                             (cwr_bio->bi_sector & cc->cell_mask);
-        generic_make_request(cwr_bio);
-    }
+        bio->bi_bdev = cc->cell_meta[cell_id].dev->bdev;
+        bio->bi_sector = cc->cell_meta[cell_id].offset +
+                         (bio->bi_sector & cc->cell_mask);
+        generic_make_request(bio);
+    //}
 
     spin_unlock(&cc->lock);
 

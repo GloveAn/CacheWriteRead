@@ -58,7 +58,11 @@ struct cwr_swap_info
 
 struct cwr_bio_info
 {
-    struct bio *bio;
+    sector_t sector;
+    struct block_device *bdev;
+    bio_end_io_t *end_io;
+    void *private;
+
     struct cwr_cell_meta *ccm;
 };
 
