@@ -260,7 +260,7 @@ static void cell_manager(unsigned long data)
     printk(KERN_DEBUG "cwr: cell manager triggered");
     printk(KERN_DEBUG "    io freq:%d, io count:%d",
            io_frenquency, cc->old_io_count); // DEBUG */
-return;
+    return;
     // trigger under certain conditions
     if(cc->io_count >= IO_COUNT_THRESHOLD &&
        io_frenquency <= CELL_MANAGE_THRESHOLD)
@@ -359,6 +359,39 @@ return;
     add_timer(&cc->cell_manage_timer);
 }
 
+struct cwr_bio_info *get_bio_info_node(struct cwr_context *cc)
+{
+    unsigned long flag;
+    struct cwr_bio_info *cbi;
+
+    while(1)
+    {
+        spin_lock_irqsave(&cc->lock, flag);
+        if(list_empty(&cc->pool_list))
+        {
+            spin_unlock_irqrestore(&cc->lock, flag);
+            schedule();
+        }
+        else
+        {
+            cbi = list_entry(cc->pool_list.next,
+                             struct cwr_bio_info, pool_list);
+            list_del_init(&cbi->pool_list);
+            spin_unlock_irqrestore(&cc->lock, flag);
+            return cbi;
+        }
+    }
+}
+
+static void put_bio_info_node(struct cwr_bio_info *cbi)
+{
+    unsigned long flag;
+
+    spin_lock_irqsave(&cbi->cc->lock, flag);
+    list_add(&cbi->pool_list, &cbi->cc->pool_list);
+    spin_unlock_irqrestore(&cbi->cc->lock, flag);
+}
+
 static inline sector_t get_cell_id(struct dm_target *dt,
                                    struct cwr_context *cc,
                                    struct bio *bio)
@@ -386,7 +419,7 @@ static void cwr_end_io(struct bio *bio, int error)
     spin_unlock_irqrestore(&cbi->cc->lock, flag);
 
     bio_endio(bio, error);
-    mempool_free(cbi, bio_info_pool);
+    put_bio_info_node(cbi);
 }
 
 static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
@@ -431,7 +464,7 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     }
     cc->cell_meta[cell_id].z_value += z_value;
 
-    cbi = (struct cwr_bio_info *)mempool_alloc(bio_info_pool, GFP_NOIO);
+    cbi = get_bio_info_node(cc);
 
     cbi->sector = bio->bi_sector;
     cbi->bdev = bio->bi_bdev;
@@ -501,7 +534,8 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
     cell_amount = dt->len >> ilog2(cell_size);
 
     cc = kzalloc(sizeof(struct cwr_context) +
-                 sizeof(struct cwr_cell_meta) * cell_amount,
+                 sizeof(struct cwr_cell_meta) * cell_amount +
+                 sizeof(struct cwr_bio_info) * BIO_INFO_AMOUNT,
                  GFP_KERNEL);
     if(cc == 0)
     {
@@ -597,6 +631,17 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
         list_add(&cc->cell_meta[i].rw_list, &cc->write_list);
     }
 
+    cc->bio_infos = (struct cwr_bio_info *)
+                    ((unsigned char *)cc +
+                     sizeof(struct cwr_context) +
+                     sizeof(struct cwr_cell_meta) * cell_amount);
+    INIT_LIST_HEAD(&cc->pool_list);
+    for(j = 0; j < BIO_INFO_AMOUNT; j++)
+    {
+        INIT_LIST_HEAD(&cc->bio_infos[j].pool_list);
+        list_add(&cc->bio_infos[j].pool_list, &cc->pool_list);
+    }
+
     init_timer(&cc->cell_manage_timer);
     cc->cell_manage_timer.data = (unsigned long)cc;
     cc->cell_manage_timer.function = cell_manager;
@@ -653,7 +698,7 @@ static struct target_type cwr_target = {
 static int __init cwr_init(void)
 {
     int re;
-
+#if 0
     /* init bio info pool */
     bio_info_cache = kmem_cache_create("cwr_bio_info",
                                        sizeof(struct cwr_bio_info),
@@ -667,7 +712,7 @@ static int __init cwr_init(void)
     bio_info_pool = mempool_create(MIN_BIO_INFO_AMOUNT,
                                    mempool_alloc_slab, mempool_free_slab,
                                    bio_info_cache);
-
+#endif
     re = dm_register_target(&cwr_target);
     if(re < 0)
     {
@@ -679,17 +724,18 @@ static int __init cwr_init(void)
     return 0;
 
 register_target_fail:
+#if 0
     mempool_destroy(bio_info_pool);
     kmem_cache_destroy(bio_info_cache);
-
+#endif
     return re;
 }
 
 static void __exit cwr_done(void)
 {
     dm_unregister_target(&cwr_target);
-    mempool_destroy(bio_info_pool);
-    kmem_cache_destroy(bio_info_cache);
+    //mempool_destroy(bio_info_pool);
+    //kmem_cache_destroy(bio_info_cache);
     printk(KERN_DEBUG "cwr exited.");
 }
 

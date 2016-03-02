@@ -46,7 +46,7 @@
 #define CELL_STATE_MIGRATING 1 << 1
 
 /* bio info minimal available amount */
-#define MIN_BIO_INFO_AMOUNT 256
+#define BIO_INFO_AMOUNT 256
 
 struct cwr_bio_info
 {
@@ -57,6 +57,8 @@ struct cwr_bio_info
 
     struct cwr_context *cc;
     struct cwr_cell_meta *ccm;
+
+    struct list_head pool_list;
 };
 
 struct cwr_cell_meta
@@ -95,6 +97,9 @@ struct cwr_context
     struct cwr_cell_meta *cell_meta;
     struct list_head read_list; // store read oriented cells
     struct list_head write_list; // store write oriented cells
+
+    struct cwr_bio_info *bio_infos;
+    struct list_head pool_list;
 
     /* coarse grain counter, work without mutex */
     unsigned int io_count;
