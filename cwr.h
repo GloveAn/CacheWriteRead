@@ -36,7 +36,7 @@
 #define RW_STATE_THRESHOLD 20
 
 // time interval for managing data cells
-#define CELL_MANAGE_INTERVAL  5 // unit in second
+#define CELL_MANAGE_INTERVAL  20 // unit in second
 // io workload to trigger data cells management
 #define CELL_MANAGE_THRESHOLD 0
 
@@ -90,11 +90,7 @@ struct cwr_context
     struct dm_dev *read_dev;
     struct dm_dev *write_dev;
 
-    sector_t cold_dev_size; // unit in sector
-    sector_t read_dev_size; // unit in sector
-    sector_t write_dev_size; // unit in sector
-
-    struct cwr_cell_meta *cell_meta;
+    struct cwr_cell_meta *cell_metas;
     struct list_head read_list; // store read oriented cells
     struct list_head write_list; // store write oriented cells
 

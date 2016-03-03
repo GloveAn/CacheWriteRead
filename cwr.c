@@ -60,7 +60,7 @@ static inline void swap_worker(struct cwr_cell_meta *ccm1,
     unsigned long error_bits, flag  ;
     int re;
 
-    spin_lock(&cc->lock);
+    spin_lock_irqsave(&cc->lock, flag);
 
     if(ccm1->state & CELL_STATE_ACCESSING &&
        ccm2->state & CELL_STATE_ACCESSING)
@@ -72,7 +72,7 @@ static inline void swap_worker(struct cwr_cell_meta *ccm1,
     ccm1->state |= CELL_STATE_MIGRATING;
     ccm2->state |= CELL_STATE_MIGRATING;
 
-    spin_unlock(&cc->lock);
+    spin_unlock_irqrestore(&cc->lock, flag);
 
     /* read cell data to memory */
     dir1 = make_io_region(cc, ccm1);
@@ -113,12 +113,13 @@ static inline void swap_worker(struct cwr_cell_meta *ccm1,
     ccm1->offset = ccm2->offset;
     ccm2->offset = tmp_offset;
 
+    //* DEBUG
     printk(KERN_DEBUG "cwr: swap worker runs well.");
     printk(KERN_DEBUG "    swapped pair ccm1:%d, ccm2:%d.",
-           ccm1 - cc->cell_meta, ccm2 - cc->cell_meta);
+           ccm1 - cc->cell_metas, ccm2 - cc->cell_metas); //*/
 
 exit_swap:
-    spin_lock(&cc->lock);
+    spin_lock_irqsave(&cc->lock, flag);
 
     finish_pending_bio(cc, ccm1);
     finish_pending_bio(cc, ccm2);
@@ -126,7 +127,7 @@ exit_swap:
     ccm1->state &= !CELL_STATE_MIGRATING;
     ccm2->state &= !CELL_STATE_MIGRATING;
 
-    spin_unlock(&cc->lock);
+    spin_unlock_irqrestore(&cc->lock, flag);
 }
 
 static inline void classify_n_migrate(struct cwr_context *cc)
@@ -136,10 +137,10 @@ static inline void classify_n_migrate(struct cwr_context *cc)
     struct cwr_cell_meta *ccm;
     unsigned int i;
     void *mem1, *mem2;
-return;
+
     mem1 = vmalloc(cc->cell_size << 9);
     mem2 = vmalloc(cc->cell_size << 9);
-    //if(mem1 == 0 || mem2 == 0)
+    if(mem1 == 0 || mem2 == 0)
     {
         printk(KERN_ERR "cwr: allocate virtual memory for swaping fail.");
         goto free_memory;
@@ -194,7 +195,7 @@ return;
         }
         i++;
     }
-#if 0
+
     for(swap_node1 = wc_node.next, swap_node2 = cw_node.next;
         swap_node1->next != &wc_node && swap_node2 != &cw_node;
         swap_node1 = swap_node1->next, swap_node2 = swap_node2->next)
@@ -213,7 +214,7 @@ return;
         swap_worker(list_entry(swap_node1, struct cwr_cell_meta, class_list),
                     list_entry(swap_node2, struct cwr_cell_meta, class_list),
                     mem1, mem2, cc);
-#endif
+
     list_for_each_safe(cur_node, next_node, &wc_node) list_del_init(cur_node);
     list_for_each_safe(cur_node, next_node, &cw_node) list_del_init(cur_node);
     list_for_each_safe(cur_node, next_node, &rc_node) list_del_init(cur_node);
@@ -247,12 +248,13 @@ static void migration_worker(struct work_struct *work)
     int io_frenquency;
     int min_z_value = INT_MAX;
 
-    cc = container_of(work, struct cwr_context, migration_work);
+    cc = container_of(to_delayed_work(work),
+                      struct cwr_context, migration_work);
 
     io_frenquency = (cc->io_count - cc->old_io_count) / CELL_MANAGE_INTERVAL;
     cc->old_io_count = cc->io_count;
 
-    //* DEBUG
+    /* DEBUG
     printk(KERN_DEBUG "cwr: cell manager triggered");
     printk(KERN_DEBUG "    io freq:%d, io count:%d",
            io_frenquency, cc->old_io_count); // DEBUG */
@@ -261,7 +263,7 @@ static void migration_worker(struct work_struct *work)
     if(cc->io_count >= IO_COUNT_THRESHOLD &&
        io_frenquency <= CELL_MANAGE_THRESHOLD)
     {
-        printk(KERN_DEBUG "cwr: cell manager is activated."); // DEBUG
+        //printk(KERN_DEBUG "cwr: cell manager is activated."); // DEBUG
 
         /* clear read count / write count, and z value to prevent overflow */
         list_for_each(cur_node, &cc->read_list)
@@ -343,7 +345,7 @@ static void migration_worker(struct work_struct *work)
          *   1. it's in accessing
          *   2. we can't find a pair for it
          */
-        //classify_n_migrate(cc);
+        classify_n_migrate(cc);
 
         // reset io count after migration
         cc->io_count = 0;
@@ -457,7 +459,7 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
         do_div(seek_distance, T2);
         z_value = (T1 + seek_distance) << z_value;
     }
-    cc->cell_meta[cell_id].z_value += z_value;
+    cc->cell_metas[cell_id].z_value += z_value;
 
     cbi = get_bio_info_node(cc);
 
@@ -467,37 +469,37 @@ static int cwr_map(struct dm_target *dt, struct bio *bio, union map_info *mi)
     cbi->private = bio->bi_private;
 
     cbi->cc = cc;
-    cbi->ccm = cc->cell_meta + cell_id;
+    cbi->ccm = cc->cell_metas + cell_id;
 
     bio->bi_end_io = cwr_end_io;
     bio->bi_private = cbi;
 
-    cc->cell_meta[cell_id].read_count += read_flag;
-    cc->cell_meta[cell_id].write_count += write_flag;
+    cc->cell_metas[cell_id].read_count += read_flag;
+    cc->cell_metas[cell_id].write_count += write_flag;
 
     spin_lock_irqsave(&cc->lock, flag);
 
     cc->last_cell = cell_id;
 
     // when bio count reaches 0, we will change cwr state to ready.
-    cc->cell_meta[cell_id].bio_count++;
-    cc->cell_meta[cell_id].state |= CELL_STATE_ACCESSING;
+    cc->cell_metas[cell_id].bio_count++;
+    cc->cell_metas[cell_id].state |= CELL_STATE_ACCESSING;
 
-    //if(cc->cell_meta[cell_id].state & CELL_STATE_MIGRATING)
-    //{
+    if(cc->cell_metas[cell_id].state & CELL_STATE_MIGRATING)
+    {
         // pend bio when migrating
-        //bio_list_add(&cc->cell_meta[cell_id].bio_list, cwr_bio);
-        //spin_unlock_irqrestore(&cc->lock, flag);
-    //}
-    //else
-    //{
+        bio_list_add(&cc->cell_metas[cell_id].bio_list, bio);
+        spin_unlock_irqrestore(&cc->lock, flag);
+    }
+    else
+    {
         spin_unlock_irqrestore(&cc->lock, flag);
         /* redirect bio */
-        bio->bi_bdev = cc->cell_meta[cell_id].dev->bdev;
-        bio->bi_sector = cc->cell_meta[cell_id].offset +
+        bio->bi_bdev = cc->cell_metas[cell_id].dev->bdev;
+        bio->bi_sector = cc->cell_metas[cell_id].offset +
                          (bio->bi_sector & cc->cell_mask);
         generic_make_request(bio);
-    //}
+    }
 
     return DM_MAPIO_SUBMITTED;
 }
@@ -507,6 +509,7 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
 {
     struct cwr_context *cc;
     unsigned int cell_size, cell_amount;
+    sector_t write_dev_size, read_dev_size, cold_dev_size;
     int re = 0;
     unsigned int i, j;
 
@@ -552,41 +555,42 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
     cc->cell_size = cell_size;
     cc->cell_mask = cell_size - 1;
 
-    cc->write_dev_size = WRITE_CACHE_SIZE * cc->cell_size;
-    cc->read_dev_size = READ_CACHE_SIZE * cc->cell_size;
-    cc->cold_dev_size = dt->len - cc->write_dev_size - cc->read_dev_size;
+    // device size measured by sector
+    write_dev_size = WRITE_CACHE_SIZE * cc->cell_size;
+    read_dev_size = READ_CACHE_SIZE * cc->cell_size;
+    cold_dev_size = dt->len - write_dev_size - read_dev_size;
 
     /* get mapped targets */
-    re |= dm_get_device(dt, argv[1], 0, cc->cold_dev_size,
+    re |= dm_get_device(dt, argv[1], 0, cold_dev_size,
                         dm_table_get_mode(dt->table), &cc->cold_dev);
-    re |= dm_get_device(dt, argv[2], 0, cc->write_dev_size,
+    re |= dm_get_device(dt, argv[2], 0, write_dev_size,
                         dm_table_get_mode(dt->table), &cc->write_dev);
-    re |= dm_get_device(dt, argv[3], 0, cc->read_dev_size,
+    re |= dm_get_device(dt, argv[3], 0, read_dev_size,
                         dm_table_get_mode(dt->table), &cc->read_dev);
     if(re != 0) goto device_invalid;
 
     // disk size check
     // i_size_read returns device size by bytes
-    if((i_size_read(cc->cold_dev->bdev->bd_inode) < (cc->cold_dev_size << 9))
-    || (i_size_read(cc->write_dev->bdev->bd_inode) < (cc->write_dev_size << 9))
-    || (i_size_read(cc->read_dev->bdev->bd_inode) < (cc->read_dev_size << 9)))
+    if((i_size_read(cc->cold_dev->bdev->bd_inode) < (cold_dev_size << 9))
+    || (i_size_read(cc->write_dev->bdev->bd_inode) < (write_dev_size << 9))
+    || (i_size_read(cc->read_dev->bdev->bd_inode) < (read_dev_size << 9)))
     {
         dt->error = "disk is too small";
         re = -EINVAL;
         goto size_invalid;
     }
     // alignment check (may be reduntant)
-    if((cc->cold_dev_size & (cc->cell_size - 1))
-    || (cc->write_dev_size & (cc->cell_size - 1))
-    || (cc->read_dev_size & (cc->cell_size - 1)))
+    if((cold_dev_size & (cc->cell_size - 1))
+    || (write_dev_size & (cc->cell_size - 1))
+    || (read_dev_size & (cc->cell_size - 1)))
     {
         dt->error = "disk size is not alignt";
         re = -EINVAL;
         goto size_invalid;
     }
 
-    cc->cell_meta = (struct cwr_cell_meta *)
-                    ((unsigned char *)cc + sizeof(struct cwr_context));
+    cc->cell_metas = (struct cwr_cell_meta *)
+                     ((unsigned char *)cc + sizeof(struct cwr_context));
 
     INIT_LIST_HEAD(&cc->read_list);
     INIT_LIST_HEAD(&cc->write_list);
@@ -594,43 +598,43 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
     // map first logical part to write cache
     for(j = 0; j < WRITE_CACHE_SIZE; i++, j++)
     {
-        cc->cell_meta[i].dev = cc->write_dev;
-        cc->cell_meta[i].offset = j * cell_size;
+        cc->cell_metas[i].dev = cc->write_dev;
+        cc->cell_metas[i].offset = j * cell_size;
 
-        INIT_LIST_HEAD(&cc->cell_meta[i].rw_list);
-        INIT_LIST_HEAD(&cc->cell_meta[i].class_list);
-        bio_list_init(&cc->cell_meta[i].bio_list);
+        INIT_LIST_HEAD(&cc->cell_metas[i].rw_list);
+        INIT_LIST_HEAD(&cc->cell_metas[i].class_list);
+        bio_list_init(&cc->cell_metas[i].bio_list);
 
-        list_add(&cc->cell_meta[i].rw_list, &cc->write_list);
+        list_add(&cc->cell_metas[i].rw_list, &cc->write_list);
     }
     // map second logical part to read cache
     for(j = 0; j < READ_CACHE_SIZE; i++, j++)
     {
-        cc->cell_meta[i].dev = cc->read_dev;
-        cc->cell_meta[i].offset = j * cell_size;
+        cc->cell_metas[i].dev = cc->read_dev;
+        cc->cell_metas[i].offset = j * cell_size;
 
-        INIT_LIST_HEAD(&cc->cell_meta[i].rw_list);
-        INIT_LIST_HEAD(&cc->cell_meta[i].class_list);
-        bio_list_init(&cc->cell_meta[i].bio_list);
+        INIT_LIST_HEAD(&cc->cell_metas[i].rw_list);
+        INIT_LIST_HEAD(&cc->cell_metas[i].class_list);
+        bio_list_init(&cc->cell_metas[i].bio_list);
 
-        list_add(&cc->cell_meta[i].rw_list, &cc->read_list);
+        list_add(&cc->cell_metas[i].rw_list, &cc->read_list);
     }
     // map last logical part to cold hdd
     for(j = 0; i < cell_amount; i++, j++)
     {
-        cc->cell_meta[i].dev = cc->cold_dev;
-        cc->cell_meta[i].offset = j * cell_size;
+        cc->cell_metas[i].dev = cc->cold_dev;
+        cc->cell_metas[i].offset = j * cell_size;
 
-        INIT_LIST_HEAD(&cc->cell_meta[i].rw_list);
-        INIT_LIST_HEAD(&cc->cell_meta[i].class_list);
-        bio_list_init(&cc->cell_meta[i].bio_list);
+        INIT_LIST_HEAD(&cc->cell_metas[i].rw_list);
+        INIT_LIST_HEAD(&cc->cell_metas[i].class_list);
+        bio_list_init(&cc->cell_metas[i].bio_list);
 
         // treat it as write oriented data
-        list_add(&cc->cell_meta[i].rw_list, &cc->write_list);
+        list_add(&cc->cell_metas[i].rw_list, &cc->write_list);
     }
 
     cc->bio_infos = (struct cwr_bio_info *)
-                    ((unsigned char *)(cc->cell_meta) +
+                    ((unsigned char *)(cc->cell_metas) +
                      sizeof(struct cwr_cell_meta) * cell_amount);
     INIT_LIST_HEAD(&cc->pool_list);
     for(j = 0; j < BIO_INFO_AMOUNT; j++)
@@ -697,14 +701,14 @@ static int __init cwr_init(void)
     migration_work_queue = create_singlethread_workqueue("cwr_migration");
     if(migration_work_queue == 0)
     {
-        printk(KERN_ERR "create cwr work queue fail.");
+        printk(KERN_ERR "cwr: create cwr work queue fail.");
         return -ENOMEM;
     }
 
     re = dm_register_target(&cwr_target);
     if(re < 0)
     {
-        printk(KERN_ERR "regist cwr target fail.");
+        printk(KERN_ERR "cwr: regist cwr target fail.");
         destroy_workqueue(migration_work_queue);
         return re;
     }
