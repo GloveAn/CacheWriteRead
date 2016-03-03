@@ -113,7 +113,7 @@ static inline void swap_worker(struct cwr_cell_meta *ccm1,
     ccm1->offset = ccm2->offset;
     ccm2->offset = tmp_offset;
 
-    //* DEBUG
+    /* DEBUG
     printk(KERN_DEBUG "cwr: swap worker runs well.");
     printk(KERN_DEBUG "    swapped pair ccm1:%d, ccm2:%d.",
            ccm1 - cc->cell_metas, ccm2 - cc->cell_metas); //*/
@@ -651,9 +651,9 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
 
     dt->private = cc;
 
-    printk(KERN_DEBUG "cwr: a device is constructed.");
-    printk(KERN_DEBUG "    cell size: %llu", cc->cell_size);
-    printk(KERN_DEBUG "    c: %s, w:%s, r:%s",
+    printk(KERN_INFO "cwr: a device is constructed.");
+    printk(KERN_INFO "    cell size: %llu", cc->cell_size);
+    printk(KERN_INFO "    c: %s, w:%s, r:%s",
            cc->cold_dev->name, cc->write_dev->name, cc->read_dev->name);
     return 0;
 
@@ -679,14 +679,14 @@ static void cwr_dtr(struct dm_target *dt)
     dm_put_device(dt, cc->read_dev);
     vfree(cc);
 
-    printk(KERN_DEBUG "cwr: a device is destructed.");
-    printk(KERN_DEBUG "    c: %s, w:%s, r:%s",
+    printk(KERN_INFO "cwr: a device is destructed.");
+    printk(KERN_INFO "    c: %s, w:%s, r:%s",
            cc->cold_dev->name, cc->write_dev->name, cc->read_dev->name);
 }
 
 static struct target_type cwr_target = {
 	.name    = "cwr",
-	.version = {0, 9, 0},
+	.version = {1, 0, 0},
 	.module  = THIS_MODULE,
 	.ctr     = cwr_ctr,
 	.dtr     = cwr_dtr,
@@ -713,7 +713,7 @@ static int __init cwr_init(void)
         return re;
     }
 
-    printk(KERN_DEBUG "cwr loaded.");
+    printk(KERN_INFO "cwr loaded.");
     return 0;
 }
 
@@ -722,7 +722,7 @@ static void __exit cwr_done(void)
     dm_unregister_target(&cwr_target);
     //flush_workqueue(migration_work_queue);
     destroy_workqueue(migration_work_queue);
-    printk(KERN_DEBUG "cwr exited.");
+    printk(KERN_INFO "cwr exited.");
 }
 
 module_init(cwr_init);
