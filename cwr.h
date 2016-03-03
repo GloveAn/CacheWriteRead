@@ -8,7 +8,7 @@
 #include <linux/log2.h>
 #include <linux/timer.h>
 #include <linux/spinlock.h>
-#include <asm/atomic.h>
+#include <linux/workqueue.h>
 
 // NOTE: sector_t = u64 = unsigned long long
 
@@ -36,7 +36,7 @@
 #define RW_STATE_THRESHOLD 20
 
 // time interval for managing data cells
-#define CELL_MANAGE_INTERVAL  20 // unit in second
+#define CELL_MANAGE_INTERVAL  5 // unit in second
 // io workload to trigger data cells management
 #define CELL_MANAGE_THRESHOLD 0
 
@@ -105,9 +105,8 @@ struct cwr_context
     unsigned int io_count;
     unsigned int old_io_count; // for calculating io frequency
 
+    struct delayed_work migration_work;
     struct dm_io_client *io_client;
-
-    struct timer_list cell_manage_timer; // for cell management
 
     spinlock_t lock;
 };

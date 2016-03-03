@@ -1,7 +1,6 @@
 #include "cwr.h"
 
-static struct kmem_cache *bio_info_cache;
-static mempool_t *bio_info_pool;
+static struct workqueue_struct *migration_work_queue;
 
 static inline void finish_pending_bio(struct cwr_context *cc,
                                       struct cwr_cell_meta *ccm)
@@ -58,7 +57,7 @@ static inline void swap_worker(struct cwr_cell_meta *ccm1,
     struct dm_io_region dir1, dir2;
     struct dm_dev *tmp_dev;
     sector_t tmp_offset;
-    unsigned long error_bits;
+    unsigned long error_bits, flag  ;
     int re;
 
     spin_lock(&cc->lock);
@@ -130,17 +129,17 @@ exit_swap:
     spin_unlock(&cc->lock);
 }
 
-static inline void enqueue_swap(struct cwr_context *cc)
+static inline void classify_n_migrate(struct cwr_context *cc)
 {
     struct list_head wc_node, cw_node, wr_node, rw_node, rc_node, cr_node;
     struct list_head *cur_node, *next_node, *swap_node1, *swap_node2;
     struct cwr_cell_meta *ccm;
     unsigned int i;
     void *mem1, *mem2;
-
+return;
     mem1 = vmalloc(cc->cell_size << 9);
     mem2 = vmalloc(cc->cell_size << 9);
-    if(mem1 == 0 || mem2 == 0)
+    //if(mem1 == 0 || mem2 == 0)
     {
         printk(KERN_ERR "cwr: allocate virtual memory for swaping fail.");
         goto free_memory;
@@ -195,7 +194,7 @@ static inline void enqueue_swap(struct cwr_context *cc)
         }
         i++;
     }
-
+#if 0
     for(swap_node1 = wc_node.next, swap_node2 = cw_node.next;
         swap_node1->next != &wc_node && swap_node2 != &cw_node;
         swap_node1 = swap_node1->next, swap_node2 = swap_node2->next)
@@ -214,7 +213,7 @@ static inline void enqueue_swap(struct cwr_context *cc)
         swap_worker(list_entry(swap_node1, struct cwr_cell_meta, class_list),
                     list_entry(swap_node2, struct cwr_cell_meta, class_list),
                     mem1, mem2, cc);
-
+#endif
     list_for_each_safe(cur_node, next_node, &wc_node) list_del_init(cur_node);
     list_for_each_safe(cur_node, next_node, &cw_node) list_del_init(cur_node);
     list_for_each_safe(cur_node, next_node, &rc_node) list_del_init(cur_node);
@@ -240,18 +239,15 @@ static int list_sort_cmp(void *priv, struct list_head* a, struct list_head* b)
     return ccm1->z_value < ccm2->z_value;
 }
 
-static void cell_manager(unsigned long data)
+static void migration_worker(struct work_struct *work)
 {
-    /* as the timer is set when this function returns,
-     * there will be at most one timer running.
-     * so no worry about concurrency.
-     * all io operations here are sync io.
-     */
-    struct cwr_context *cc = (struct cwr_context *)data;
+    struct cwr_context *cc;
     struct list_head *cur_node, *next_node;
     struct cwr_cell_meta *ccm;
     int io_frenquency;
     int min_z_value = INT_MAX;
+
+    cc = container_of(work, struct cwr_context, migration_work);
 
     io_frenquency = (cc->io_count - cc->old_io_count) / CELL_MANAGE_INTERVAL;
     cc->old_io_count = cc->io_count;
@@ -260,12 +256,12 @@ static void cell_manager(unsigned long data)
     printk(KERN_DEBUG "cwr: cell manager triggered");
     printk(KERN_DEBUG "    io freq:%d, io count:%d",
            io_frenquency, cc->old_io_count); // DEBUG */
-    return;
+
     // trigger under certain conditions
     if(cc->io_count >= IO_COUNT_THRESHOLD &&
        io_frenquency <= CELL_MANAGE_THRESHOLD)
     {
-        //printk_once(KERN_DEBUG "cwr: cell manager is activated."); // DEBUG
+        printk(KERN_DEBUG "cwr: cell manager is activated."); // DEBUG
 
         /* clear read count / write count, and z value to prevent overflow */
         list_for_each(cur_node, &cc->read_list)
@@ -304,7 +300,7 @@ static void cell_manager(unsigned long data)
 	    }
 
         /* clear z value,
-         * migrate list node by its read count and write count
+         * update read list and write list
          */
         list_for_each_safe(cur_node, next_node, &cc->read_list)
         {
@@ -347,16 +343,15 @@ static void cell_manager(unsigned long data)
          *   1. it's in accessing
          *   2. we can't find a pair for it
          */
-        enqueue_swap(cc);
+        //classify_n_migrate(cc);
 
         // reset io count after migration
         cc->io_count = 0;
         cc->old_io_count = 0;
     }
 
-    /* restart timer */
-    cc->cell_manage_timer.expires = jiffies + CELL_MANAGE_INTERVAL * HZ;
-    add_timer(&cc->cell_manage_timer);
+    queue_delayed_work(migration_work_queue, &cc->migration_work,
+                       CELL_MANAGE_INTERVAL * HZ);
 }
 
 struct cwr_bio_info *get_bio_info_node(struct cwr_context *cc)
@@ -533,10 +528,13 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
     }
     cell_amount = dt->len >> ilog2(cell_size);
 
-    cc = kzalloc(sizeof(struct cwr_context) +
+    cc = vmalloc(sizeof(struct cwr_context) +
                  sizeof(struct cwr_cell_meta) * cell_amount +
-                 sizeof(struct cwr_bio_info) * BIO_INFO_AMOUNT,
-                 GFP_KERNEL);
+                 sizeof(struct cwr_bio_info) * BIO_INFO_AMOUNT);
+    memset(cc, 0,
+           sizeof(struct cwr_context) +
+           sizeof(struct cwr_cell_meta) * cell_amount +
+           sizeof(struct cwr_bio_info) * BIO_INFO_AMOUNT);
     if(cc == 0)
     {
         dt->error = "cannot allocate cwr context";
@@ -627,13 +625,12 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
         INIT_LIST_HEAD(&cc->cell_meta[i].class_list);
         bio_list_init(&cc->cell_meta[i].bio_list);
 
-        // conside it as write oriented data
+        // treat it as write oriented data
         list_add(&cc->cell_meta[i].rw_list, &cc->write_list);
     }
 
     cc->bio_infos = (struct cwr_bio_info *)
-                    ((unsigned char *)cc +
-                     sizeof(struct cwr_context) +
+                    ((unsigned char *)(cc->cell_meta) +
                      sizeof(struct cwr_cell_meta) * cell_amount);
     INIT_LIST_HEAD(&cc->pool_list);
     for(j = 0; j < BIO_INFO_AMOUNT; j++)
@@ -642,11 +639,9 @@ static int cwr_ctr(struct dm_target *dt, unsigned int argc, char *argv[])
         list_add(&cc->bio_infos[j].pool_list, &cc->pool_list);
     }
 
-    init_timer(&cc->cell_manage_timer);
-    cc->cell_manage_timer.data = (unsigned long)cc;
-    cc->cell_manage_timer.function = cell_manager;
-    cc->cell_manage_timer.expires = jiffies + CELL_MANAGE_INTERVAL * HZ;
-    //add_timer(&cc->cell_manage_timer);
+    INIT_DELAYED_WORK(&(cc->migration_work), migration_worker);
+    queue_delayed_work(migration_work_queue, &cc->migration_work,
+                       CELL_MANAGE_INTERVAL * HZ);
 
     spin_lock_init(&cc->lock);
 
@@ -664,7 +659,7 @@ device_invalid:
     if(cc->write_dev) dm_put_device(dt, cc->write_dev);
     if(cc->read_dev) dm_put_device(dt, cc->read_dev);
 io_client_fail:
-    kfree(cc);
+    vfree(cc);
     return re;
 }
 
@@ -672,13 +667,13 @@ static void cwr_dtr(struct dm_target *dt)
 {
     struct cwr_context *cc = (struct cwr_context *)dt->private;
 
-    del_timer_sync(&cc->cell_manage_timer);
+    cancel_delayed_work_sync(&cc->migration_work);
     dm_io_client_destroy(cc->io_client);
 
     dm_put_device(dt, cc->cold_dev);
     dm_put_device(dt, cc->write_dev);
     dm_put_device(dt, cc->read_dev);
-    kfree(cc);
+    vfree(cc);
 
     printk(KERN_DEBUG "cwr: a device is destructed.");
     printk(KERN_DEBUG "    c: %s, w:%s, r:%s",
@@ -698,44 +693,31 @@ static struct target_type cwr_target = {
 static int __init cwr_init(void)
 {
     int re;
-#if 0
-    /* init bio info pool */
-    bio_info_cache = kmem_cache_create("cwr_bio_info",
-                                       sizeof(struct cwr_bio_info),
-                                       0, 0, 0);
-    if(bio_info_cache == 0)
+
+    migration_work_queue = create_singlethread_workqueue("cwr_migration");
+    if(migration_work_queue == 0)
     {
-        printk(KERN_ERR "allocate bio info cache fail.");
+        printk(KERN_ERR "create cwr work queue fail.");
         return -ENOMEM;
     }
-    // mempool_create will success on return
-    bio_info_pool = mempool_create(MIN_BIO_INFO_AMOUNT,
-                                   mempool_alloc_slab, mempool_free_slab,
-                                   bio_info_cache);
-#endif
+
     re = dm_register_target(&cwr_target);
     if(re < 0)
     {
         printk(KERN_ERR "regist cwr target fail.");
-        goto register_target_fail;
+        destroy_workqueue(migration_work_queue);
+        return re;
     }
 
     printk(KERN_DEBUG "cwr loaded.");
     return 0;
-
-register_target_fail:
-#if 0
-    mempool_destroy(bio_info_pool);
-    kmem_cache_destroy(bio_info_cache);
-#endif
-    return re;
 }
 
 static void __exit cwr_done(void)
 {
     dm_unregister_target(&cwr_target);
-    //mempool_destroy(bio_info_pool);
-    //kmem_cache_destroy(bio_info_cache);
+    //flush_workqueue(migration_work_queue);
+    destroy_workqueue(migration_work_queue);
     printk(KERN_DEBUG "cwr exited.");
 }
 
